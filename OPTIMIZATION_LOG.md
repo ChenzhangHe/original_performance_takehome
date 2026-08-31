@@ -356,3 +356,68 @@ Insights:
 - The best schedule uses a soft wavefront: a small cohort advances across rounds while deeper progress is penalized enough to prevent a long underfilled tail.
 - Both extremes are poor: single-chunk depth-first creates a tail; full-batch lockstep destroys load/hash overlap.
 - This checkpoint is committed before continuing the final search toward 1,363.
+
+## Iteration 7 — Final threshold search
+
+### 7a. Partial VALU-to-ALU offload
+
+- Parameterized root XOR and child-index addition offload by chunk count.
+- Best coarse combination: root XOR offloaded for 28 chunks; index addition offloaded for all 32 chunks.
+- Result before scheduler retuning: `1373` cycles.
+- Insight: partial offload can outperform both all-vector and all-scalar choices because it balances issue widths without maximizing join latency on every stream.
+
+### 7b. Remove stale fused-hash constants
+
+- Removed vector constants for shift values 12 and 3, which became unused after `multiply_add` fusion.
+- Scratch use fell from `1536` to `1519` words.
+- Setup remained load-bound, so cycle count did not change directly.
+
+### 7c. Merge setup and kernel DAGs
+
+- Generalized scratch read/write analysis for load, store, ALU, VALU, and flow slots.
+- Folded setup operations into the global dependency graph so constants and shallow-node preprocessing can overlap the early kernel wavefront.
+- Result: `1372` cycles.
+
+### 7d. Input-address engine experiment
+
+- Replaced 31 load-engine address constants with flow-engine `add_imm`, then searched mixed load/flow splits.
+- Full flow regressed to `1373`; the 1-wide flow chain delayed initial vloads.
+- Best choice remains loading all addresses directly. This candidate was rejected.
+
+### 7e. Fine-grained soft-wavefront search
+
+- Searched cohort penalties from 200 through 460 in increments of 10.
+- Best body schedules: penalty 230 → `1360`, 240/250 → `1361`.
+- Selected policy: `cohort_230`.
+
+Results:
+
+- Official submission tests: `9 / 9` pass.
+- Correctness: pass across all 8 randomized checks.
+- Local `Tests.test_kernel_cycles`: pass.
+- Cycles: `1360`.
+- Speedup: `108.63x`.
+- Thresholds passed: every published threshold, including Claude Opus 4.5 improved harness (`<1363`).
+- `git diff HEAD -- tests/`: empty.
+
+Key insight: the last 24-cycle improvement came primarily from finding the correct software-pipeline wavefront, not from reducing arithmetic. A narrow change in cohort penalty moved the schedule from 1,372 to 1,360 cycles with identical semantic work.
+
+### 7f. Fine neighborhood and contiguous top-node load
+
+- Searched every cohort penalty from 221 through 249. Penalties 226–233 all reproduce `1360`; 230 remains the canonical selection.
+- Re-swept nearby root/index ALU-offload combinations. `root=28`, `index=32` remains best at `1360` before memory cleanup.
+- Observed that the root plus depth-1/depth-2 nodes occupy seven contiguous memory words but were initialized using seven scalar node loads and several address constants.
+- Allocated one eight-word scratch block and loaded the entire top-tree prefix with one `vload`.
+
+Final v2 result:
+
+- Official submission tests: `9 / 9` pass.
+- Correctness: pass across all 8 randomized checks.
+- Local `Tests.test_kernel_cycles`: pass.
+- Cycles: `1354`.
+- Speedup: `109.11x`.
+- Scratch used: `1515 / 1536` words.
+- `git diff HEAD -- tests/`: empty.
+- `git diff --check`: pass.
+
+Final insight: after scheduling brought the kernel near its load floor, a small data-layout observation—seven adjacent tree nodes—was worth more than another scheduler tweak. One vector load removed eleven load-engine slots and six measured cycles.

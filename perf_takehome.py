@@ -38,6 +38,10 @@ from problem import (
 
 
 LOOKUP_DEPTH = 2
+ALU_ROOT_CHUNKS = 28
+ALU_INDEX_CHUNKS = 32
+SETUP_CHUNK = 32
+LOAD_ADDR_CHUNKS = 32
 
 
 class KernelBuilder:
@@ -61,8 +65,41 @@ class KernelBuilder:
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
-    def pack_setup(self):
-        """Schedule the simple load/broadcast/ALU prologue from inferred hazards."""
+    def instruction_accesses(self, engine, slot):
+        """Return scratch addresses read and written by an instruction slot."""
+        if engine == "load":
+            if slot[0] == "const":
+                return set(), {slot[1]}
+            if slot[0] == "load":
+                return {slot[2]}, {slot[1]}
+            if slot[0] == "vload":
+                return {slot[2]}, set(range(slot[1], slot[1] + VLEN))
+            if slot[0] == "load_offset":
+                return {slot[2] + slot[3]}, {slot[1] + slot[3]}
+        if engine == "store":
+            if slot[0] == "vstore":
+                return {slot[1]} | set(range(slot[2], slot[2] + VLEN)), set()
+            if slot[0] == "store":
+                return {slot[1], slot[2]}, set()
+        if engine == "alu":
+            return {slot[2], slot[3]}, {slot[1]}
+        if engine == "valu":
+            if slot[0] == "vbroadcast":
+                return {slot[2]}, set(range(slot[1], slot[1] + VLEN))
+            if slot[0] == "multiply_add":
+                reads = set()
+                for addr in slot[2:5]:
+                    reads.update(range(addr, addr + VLEN))
+                return reads, set(range(slot[1], slot[1] + VLEN))
+            reads = set(range(slot[2], slot[2] + VLEN))
+            reads.update(range(slot[3], slot[3] + VLEN))
+            return reads, set(range(slot[1], slot[1] + VLEN))
+        if engine == "flow" and slot[0] == "add_imm":
+            return {slot[2]}, {slot[1]}
+        raise ValueError((engine, slot))
+
+    def pack_setup(self, extract=False, setup_chunk=-1):
+        """Infer setup hazards, then either schedule or return its DAG."""
         flat = [
             {"engine": engine, "slot": slot}
             for instr in self.instrs
@@ -70,31 +107,24 @@ class KernelBuilder:
             for slot in slots
         ]
 
-        def accesses(op):
-            engine, slot = op["engine"], op["slot"]
-            if engine == "load":
-                if slot[0] == "const":
-                    return set(), {slot[1]}
-                if slot[0] == "load":
-                    return {slot[2]}, {slot[1]}
-            if engine == "alu":
-                return {slot[2], slot[3]}, {slot[1]}
-            if engine == "valu" and slot[0] == "vbroadcast":
-                return {slot[2]}, set(range(slot[1], slot[1] + VLEN))
-            raise ValueError((engine, slot))
-
         last_writer = {}
         readers = defaultdict(set)
         successors = [[] for _ in flat]
         remaining = []
         for op_id, op in enumerate(flat):
-            reads, writes = accesses(op)
+            reads, writes = self.instruction_accesses(op["engine"], op["slot"])
             deps = {last_writer[addr] for addr in reads if addr in last_writer}
             for addr in writes:
                 if addr in last_writer:
                     deps.add(last_writer[addr])
                 deps.update(readers[addr])
             remaining.append(len(deps))
+            op.update(
+                deps=list(deps),
+                chunk=setup_chunk,
+                round=-1,
+                local_seq=op_id,
+            )
             for dep in deps:
                 successors[dep].append(op_id)
             for addr in reads:
@@ -102,6 +132,10 @@ class KernelBuilder:
             for addr in writes:
                 last_writer[addr] = op_id
                 readers[addr].clear()
+
+        if extract:
+            self.instrs = []
+            return flat, last_writer
 
         ready = defaultdict(list)
         bottom_level = [1] * len(flat)
@@ -240,6 +274,8 @@ class KernelBuilder:
             "cohort_640",
             "cohort_960",
             "cohort_1280",
+        ) + tuple(f"cohort_{penalty}" for penalty in range(200, 461, 10)) + tuple(
+            f"cohort_{penalty}" for penalty in range(221, 250)
         )
         candidates = {policy: make_schedule(policy) for policy in policies}
         self.schedule_stats = {
@@ -296,30 +332,22 @@ class KernelBuilder:
         one = vector_const(1, "one")
         two = vector_const(2, "two")
         forest_values_vec = vector_const(forest_values_p, "forest_values_vec")
-        root_value = self.alloc_scratch("root_value")
+        top_nodes = self.alloc_scratch("top_nodes", VLEN)
+        self.add("load", ("vload", top_nodes, self.const_map[forest_values_p]))
+        root_value = top_nodes
         root_value_vec = self.alloc_scratch("root_value_vec", VLEN)
-        self.add("load", ("load", root_value, self.const_map[forest_values_p]))
         self.add("valu", ("vbroadcast", root_value_vec, root_value))
 
-        depth1_left = self.alloc_scratch("depth1_left")
-        depth1_right = self.alloc_scratch("depth1_right")
+        depth1_left = top_nodes + 1
+        depth1_right = top_nodes + 2
         depth1_delta = self.alloc_scratch("depth1_delta")
-        self.add("load", ("load", depth1_left, self.scratch_const(8)))
-        self.add("load", ("load", depth1_right, self.scratch_const(9)))
         self.add("alu", ("-", depth1_delta, depth1_left, depth1_right))
         depth1_right_vec = self.alloc_scratch("depth1_right_vec", VLEN)
         depth1_delta_vec = self.alloc_scratch("depth1_delta_vec", VLEN)
         self.add("valu", ("vbroadcast", depth1_right_vec, depth1_right))
         self.add("valu", ("vbroadcast", depth1_delta_vec, depth1_delta))
 
-        depth2_values = []
-        for tree_idx in range(3, 7):
-            node = self.alloc_scratch(f"depth2_node_{tree_idx}")
-            self.add(
-                "load",
-                ("load", node, self.scratch_const(forest_values_p + tree_idx)),
-            )
-            depth2_values.append(node)
+        depth2_values = [top_nodes + tree_idx for tree_idx in range(3, 7)]
         depth2_deltas = []
         for name, left, right in (
             ("4_minus_6", 1, 3),
@@ -354,10 +382,11 @@ class KernelBuilder:
             depth2_vectors.append(vector)
 
         hash_constants = {}
-        for _op1, val1, _op2, _op3, val3 in HASH_STAGES:
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
             if val1 not in hash_constants:
                 hash_constants[val1] = vector_const(val1, f"const_{val1:x}")
-            if val3 not in hash_constants:
+            fused = (op1, op2, op3) == ("+", "+", "<<")
+            if (not fused or val3 == 5) and val3 not in hash_constants:
                 hash_constants[val3] = vector_const(val3, f"const_{val3:x}")
         for op1, _val1, op2, op3, shift in HASH_STAGES:
             if (op1, op2, op3) == ("+", "+", "<<"):
@@ -367,8 +396,11 @@ class KernelBuilder:
                         multiplier, f"const_{multiplier:x}"
                     )
 
-        # Pack initialization before scheduling the steady-state kernel.
-        self.pack_setup()
+        # Fold initialization into the same DAG as the kernel.  Main operations
+        # gain dependencies on the setup instructions that produce their inputs.
+        setup_ops, setup_writers = self.pack_setup(
+            extract=True, setup_chunk=SETUP_CHUNK
+        )
         idx = self.alloc_scratch("idx", batch_size)
         val = self.alloc_scratch("val", batch_size)
         node_or_addr = self.alloc_scratch("node_or_addr", batch_size)
@@ -376,7 +408,7 @@ class KernelBuilder:
         tmp2 = self.alloc_scratch("tmp2", batch_size)
         input_addrs = self.alloc_scratch("input_addrs", chunk_count)
 
-        ops = []
+        ops = setup_ops
         emit_context = {"chunk": -1, "round": -1, "local_seq": 0}
 
         def emit(engine, slot, *deps):
@@ -387,6 +419,10 @@ class KernelBuilder:
                     flat_deps.extend(dep)
                 else:
                     flat_deps.append(dep)
+            reads, _writes = self.instruction_accesses(engine, slot)
+            flat_deps.extend(
+                setup_writers[addr] for addr in reads if addr in setup_writers
+            )
             ops.append(
                 {
                     "engine": engine,
@@ -404,13 +440,29 @@ class KernelBuilder:
                 for lane in range(VLEN)
             ]
 
-        input_addr_ready = [
-            emit(
-                "load",
-                ("const", input_addrs + chunk_no, inp_values_p + chunk_no * VLEN),
-            )
-            for chunk_no in range(chunk_count)
-        ]
+        input_addr_ready = [emit("load", ("const", input_addrs, inp_values_p))]
+        for chunk_no in range(1, chunk_count):
+            if chunk_no < LOAD_ADDR_CHUNKS:
+                ready = emit(
+                    "load",
+                    (
+                        "const",
+                        input_addrs + chunk_no,
+                        inp_values_p + chunk_no * VLEN,
+                    ),
+                )
+            else:
+                ready = emit(
+                    "flow",
+                    (
+                        "add_imm",
+                        input_addrs + chunk_no,
+                        input_addrs,
+                        chunk_no * VLEN,
+                    ),
+                    input_addr_ready[0],
+                )
+            input_addr_ready.append(ready)
 
         for chunk_no in range(chunk_count):
             emit_context.update(chunk=chunk_no, round=-1, local_seq=0)
@@ -432,11 +484,16 @@ class KernelBuilder:
                 emit_context["round"] = round_no
                 depth = round_no % (forest_height + 1)
                 if depth == 0:
-                    val_ready = emit(
-                        "valu",
-                        ("^", chunk_val, chunk_val, root_value_vec),
-                        val_ready,
-                    )
+                    if chunk_no < ALU_ROOT_CHUNKS:
+                        val_ready = emit_scalar_vector(
+                            "^", chunk_val, chunk_val, root_value_vec, val_ready
+                        )
+                    else:
+                        val_ready = emit(
+                            "valu",
+                            ("^", chunk_val, chunk_val, root_value_vec),
+                            val_ready,
+                        )
                 elif depth == 1 and LOOKUP_DEPTH >= 1:
                     selected = emit(
                         "valu",
@@ -520,13 +577,21 @@ class KernelBuilder:
                         selected,
                     )
                 else:
-                    addr_ready = emit_scalar_vector(
-                        "+",
-                        chunk_node,
-                        forest_values_vec,
-                        chunk_idx,
-                        idx_ready,
-                    )
+                    addr_ready = [
+                        emit(
+                            "alu",
+                            (
+                                "+",
+                                chunk_node + lane,
+                                forest_values_vec + lane,
+                                chunk_idx + lane,
+                            ),
+                            idx_ready[lane]
+                            if isinstance(idx_ready, list)
+                            else idx_ready,
+                        )
+                        for lane in range(VLEN)
+                    ]
                     node_loads = [
                         emit(
                             "load",
@@ -595,9 +660,28 @@ class KernelBuilder:
                     val_ready,
                     idx_ready,
                 )
-                idx_ready = emit(
-                    "valu", ("+", chunk_idx, chunk_idx, chunk_tmp1), parity, doubled
-                )
+                if chunk_no < ALU_INDEX_CHUNKS:
+                    idx_ready = [
+                        emit(
+                            "alu",
+                            (
+                                "+",
+                                chunk_idx + lane,
+                                chunk_idx + lane,
+                                chunk_tmp1 + lane,
+                            ),
+                            parity[lane],
+                            doubled,
+                        )
+                        for lane in range(VLEN)
+                    ]
+                else:
+                    idx_ready = emit(
+                        "valu",
+                        ("+", chunk_idx, chunk_idx, chunk_tmp1),
+                        parity,
+                        doubled,
+                    )
 
             emit(
                 "store",
