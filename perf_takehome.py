@@ -37,6 +37,9 @@ from problem import (
 )
 
 
+LOOKUP_DEPTH = 2
+
+
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -57,6 +60,194 @@ class KernelBuilder:
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
+
+    def pack_setup(self):
+        """Schedule the simple load/broadcast/ALU prologue from inferred hazards."""
+        flat = [
+            {"engine": engine, "slot": slot}
+            for instr in self.instrs
+            for engine, slots in instr.items()
+            for slot in slots
+        ]
+
+        def accesses(op):
+            engine, slot = op["engine"], op["slot"]
+            if engine == "load":
+                if slot[0] == "const":
+                    return set(), {slot[1]}
+                if slot[0] == "load":
+                    return {slot[2]}, {slot[1]}
+            if engine == "alu":
+                return {slot[2], slot[3]}, {slot[1]}
+            if engine == "valu" and slot[0] == "vbroadcast":
+                return {slot[2]}, set(range(slot[1], slot[1] + VLEN))
+            raise ValueError((engine, slot))
+
+        last_writer = {}
+        readers = defaultdict(set)
+        successors = [[] for _ in flat]
+        remaining = []
+        for op_id, op in enumerate(flat):
+            reads, writes = accesses(op)
+            deps = {last_writer[addr] for addr in reads if addr in last_writer}
+            for addr in writes:
+                if addr in last_writer:
+                    deps.add(last_writer[addr])
+                deps.update(readers[addr])
+            remaining.append(len(deps))
+            for dep in deps:
+                successors[dep].append(op_id)
+            for addr in reads:
+                readers[addr].add(op_id)
+            for addr in writes:
+                last_writer[addr] = op_id
+                readers[addr].clear()
+
+        ready = defaultdict(list)
+        bottom_level = [1] * len(flat)
+        for op_id in range(len(flat) - 1, -1, -1):
+            if successors[op_id]:
+                bottom_level[op_id] = 1 + max(
+                    bottom_level[succ] for succ in successors[op_id]
+                )
+        for op_id, count in enumerate(remaining):
+            if count == 0:
+                ready[flat[op_id]["engine"]].append(op_id)
+        bundles = []
+        scheduled = 0
+        while scheduled < len(flat):
+            chosen = []
+            bundle = {}
+            for engine in ("load", "valu", "alu"):
+                ready[engine].sort(
+                    key=lambda op_id: (bottom_level[op_id], -op_id), reverse=True
+                )
+                selected = ready[engine][: SLOT_LIMITS[engine]]
+                del ready[engine][: len(selected)]
+                if selected:
+                    bundle[engine] = [flat[op_id]["slot"] for op_id in selected]
+                    chosen.extend(selected)
+            assert chosen
+            bundles.append(bundle)
+            scheduled += len(chosen)
+            for op_id in chosen:
+                for succ in successors[op_id]:
+                    remaining[succ] -= 1
+                    if remaining[succ] == 0:
+                        ready[flat[succ]["engine"]].append(succ)
+        self.instrs = bundles
+
+    def schedule(self, ops):
+        """Try several list-scheduling priorities and retain the shortest."""
+        successors = [[] for _ in ops]
+        dep_counts = []
+        for op_id, op in enumerate(ops):
+            deps = list(dict.fromkeys(dep for dep in op["deps"] if dep is not None))
+            op["deps"] = deps
+            dep_counts.append(len(deps))
+            for dep in deps:
+                successors[dep].append(op_id)
+
+        # Bottom level is a useful critical-path priority for unit-latency ops.
+        bottom_level = [1] * len(ops)
+        for op_id in range(len(ops) - 1, -1, -1):
+            if successors[op_id]:
+                bottom_level[op_id] = 1 + max(
+                    bottom_level[succ] for succ in successors[op_id]
+                )
+
+        def priority(policy, op_id):
+            fanout = len(successors[op_id])
+            unlocks_load = any(ops[succ]["engine"] == "load" for succ in successors[op_id])
+            round_no = ops[op_id].get("round", -1)
+            local_seq = ops[op_id].get("local_seq", -1)
+            chunk_no = ops[op_id].get("chunk", -1)
+            if policy == "critical_early":
+                return (bottom_level[op_id], -op_id)
+            if policy == "critical_late":
+                return (bottom_level[op_id], op_id)
+            if policy == "fanout":
+                return (fanout, bottom_level[op_id], -op_id)
+            if policy == "load_unlock":
+                return (unlocks_load, fanout, bottom_level[op_id], -op_id)
+            if policy == "fifo":
+                return (-op_id,)
+            if policy == "lifo":
+                return (op_id,)
+            if policy == "wavefront_early":
+                return (-round_no, -local_seq, -chunk_no)
+            if policy == "wavefront_late":
+                return (-round_no, local_seq, -chunk_no)
+            if policy == "wavefront_critical":
+                return (-round_no, bottom_level[op_id], -local_seq, -chunk_no)
+            if policy.startswith("cohort_"):
+                penalty = int(policy.split("_")[1])
+                return (chunk_no * 100 - round_no * penalty, local_seq)
+            raise ValueError(policy)
+
+        def make_schedule(policy):
+            remaining = dep_counts.copy()
+            ready = defaultdict(list)
+            for op_id, count in enumerate(remaining):
+                if count == 0:
+                    ready[ops[op_id]["engine"]].append(op_id)
+
+            scheduled_count = 0
+            bundles = []
+            engine_order = ("load", "valu", "alu", "store", "flow")
+            while scheduled_count < len(ops):
+                chosen = []
+                bundle = {}
+                for engine in engine_order:
+                    candidates = ready[engine]
+                    candidates.sort(
+                        key=lambda op_id: priority(policy, op_id), reverse=True
+                    )
+                    selected = candidates[: SLOT_LIMITS[engine]]
+                    del candidates[: len(selected)]
+                    if selected:
+                        bundle[engine] = [ops[op_id]["slot"] for op_id in selected]
+                        chosen.extend(selected)
+
+                assert chosen, "Dependency cycle in scheduler"
+                bundles.append(bundle)
+                scheduled_count += len(chosen)
+                for op_id in chosen:
+                    for succ in successors[op_id]:
+                        remaining[succ] -= 1
+                        if remaining[succ] == 0:
+                            ready[ops[succ]["engine"]].append(succ)
+            return bundles
+
+        policies = (
+            "critical_early",
+            "critical_late",
+            "fanout",
+            "load_unlock",
+            "fifo",
+            "lifo",
+            "wavefront_early",
+            "wavefront_late",
+            "wavefront_critical",
+            "cohort_5",
+            "cohort_10",
+            "cohort_20",
+            "cohort_40",
+            "cohort_80",
+            "cohort_160",
+            "cohort_320",
+            "cohort_480",
+            "cohort_640",
+            "cohort_960",
+            "cohort_1280",
+        )
+        candidates = {policy: make_schedule(policy) for policy in policies}
+        self.schedule_stats = {
+            policy: len(bundles) for policy, bundles in candidates.items()
+        }
+        best_policy = min(policies, key=lambda policy: len(candidates[policy]))
+        self.schedule_policy = best_policy
+        self.instrs.extend(candidates[best_policy])
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -89,89 +280,332 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Build a SIMD kernel and list-schedule all vector chunks together.
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+        assert batch_size % VLEN == 0
+        chunk_count = batch_size // VLEN
+        forest_values_p = 7
+        inp_values_p = forest_values_p + n_nodes + batch_size
+
+        def vector_const(value, name):
+            scalar = self.scratch_const(value, f"{name}_scalar")
+            vector = self.alloc_scratch(name, VLEN)
+            self.add("valu", ("vbroadcast", vector, scalar))
+            return vector
+
+        one = vector_const(1, "one")
+        two = vector_const(2, "two")
+        forest_values_vec = vector_const(forest_values_p, "forest_values_vec")
+        root_value = self.alloc_scratch("root_value")
+        root_value_vec = self.alloc_scratch("root_value_vec", VLEN)
+        self.add("load", ("load", root_value, self.const_map[forest_values_p]))
+        self.add("valu", ("vbroadcast", root_value_vec, root_value))
+
+        depth1_left = self.alloc_scratch("depth1_left")
+        depth1_right = self.alloc_scratch("depth1_right")
+        depth1_delta = self.alloc_scratch("depth1_delta")
+        self.add("load", ("load", depth1_left, self.scratch_const(8)))
+        self.add("load", ("load", depth1_right, self.scratch_const(9)))
+        self.add("alu", ("-", depth1_delta, depth1_left, depth1_right))
+        depth1_right_vec = self.alloc_scratch("depth1_right_vec", VLEN)
+        depth1_delta_vec = self.alloc_scratch("depth1_delta_vec", VLEN)
+        self.add("valu", ("vbroadcast", depth1_right_vec, depth1_right))
+        self.add("valu", ("vbroadcast", depth1_delta_vec, depth1_delta))
+
+        depth2_values = []
+        for tree_idx in range(3, 7):
+            node = self.alloc_scratch(f"depth2_node_{tree_idx}")
+            self.add(
+                "load",
+                ("load", node, self.scratch_const(forest_values_p + tree_idx)),
+            )
+            depth2_values.append(node)
+        depth2_deltas = []
+        for name, left, right in (
+            ("4_minus_6", 1, 3),
+            ("5_minus_6", 2, 3),
+            ("3_minus_4", 0, 1),
+        ):
+            delta = self.alloc_scratch(f"depth2_delta_{name}")
+            self.add(
+                "alu", ("-", delta, depth2_values[left], depth2_values[right])
+            )
+            depth2_deltas.append(delta)
+        # Bilinear cross coefficient:
+        # v3 - v4 - v5 + v6 == (v3 - v4) - (v5 - v6).
+        self.add(
+            "alu",
+            (
+                "-",
+                depth2_deltas[2],
+                depth2_deltas[2],
+                depth2_deltas[1],
+            ),
+        )
+        depth2_vectors = []
+        for name, scalar in (
+            ("base_6", depth2_values[3]),
+            ("4_minus_6", depth2_deltas[0]),
+            ("5_minus_6", depth2_deltas[1]),
+            ("cross", depth2_deltas[2]),
+        ):
+            vector = self.alloc_scratch(f"depth2_vec_{name}", VLEN)
+            self.add("valu", ("vbroadcast", vector, scalar))
+            depth2_vectors.append(vector)
+
+        hash_constants = {}
+        for _op1, val1, _op2, _op3, val3 in HASH_STAGES:
+            if val1 not in hash_constants:
+                hash_constants[val1] = vector_const(val1, f"const_{val1:x}")
+            if val3 not in hash_constants:
+                hash_constants[val3] = vector_const(val3, f"const_{val3:x}")
+        for op1, _val1, op2, op3, shift in HASH_STAGES:
+            if (op1, op2, op3) == ("+", "+", "<<"):
+                multiplier = 1 + (1 << shift)
+                if multiplier not in hash_constants:
+                    hash_constants[multiplier] = vector_const(
+                        multiplier, f"const_{multiplier:x}"
+                    )
+
+        # Pack initialization before scheduling the steady-state kernel.
+        self.pack_setup()
+        idx = self.alloc_scratch("idx", batch_size)
+        val = self.alloc_scratch("val", batch_size)
+        node_or_addr = self.alloc_scratch("node_or_addr", batch_size)
+        tmp1 = self.alloc_scratch("tmp1", batch_size)
+        tmp2 = self.alloc_scratch("tmp2", batch_size)
+        input_addrs = self.alloc_scratch("input_addrs", chunk_count)
+
+        ops = []
+        emit_context = {"chunk": -1, "round": -1, "local_seq": 0}
+
+        def emit(engine, slot, *deps):
+            op_id = len(ops)
+            flat_deps = []
+            for dep in deps:
+                if isinstance(dep, (list, tuple, set)):
+                    flat_deps.extend(dep)
+                else:
+                    flat_deps.append(dep)
+            ops.append(
+                {
+                    "engine": engine,
+                    "slot": slot,
+                    "deps": flat_deps,
+                    **emit_context,
+                }
+            )
+            emit_context["local_seq"] += 1
+            return op_id
+
+        def emit_scalar_vector(op, dest, left, right, *deps):
+            return [
+                emit("alu", (op, dest + lane, left + lane, right + lane), *deps)
+                for lane in range(VLEN)
+            ]
+
+        input_addr_ready = [
+            emit(
+                "load",
+                ("const", input_addrs + chunk_no, inp_values_p + chunk_no * VLEN),
+            )
+            for chunk_no in range(chunk_count)
         ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        for chunk_no in range(chunk_count):
+            emit_context.update(chunk=chunk_no, round=-1, local_seq=0)
+            offset = chunk_no * VLEN
+            chunk_idx = idx + offset
+            chunk_val = val + offset
+            chunk_node = node_or_addr + offset
+            chunk_tmp1 = tmp1 + offset
+            chunk_tmp2 = tmp2 + offset
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+            val_ready = emit(
+                "load",
+                ("vload", chunk_val, input_addrs + chunk_no),
+                input_addr_ready[chunk_no],
+            )
+            idx_ready = None  # Scratch is zero-initialized, matching Input.generate.
 
-        body = []  # array of slots
+            for round_no in range(rounds):
+                emit_context["round"] = round_no
+                depth = round_no % (forest_height + 1)
+                if depth == 0:
+                    val_ready = emit(
+                        "valu",
+                        ("^", chunk_val, chunk_val, root_value_vec),
+                        val_ready,
+                    )
+                elif depth == 1 and LOOKUP_DEPTH >= 1:
+                    selected = emit(
+                        "valu",
+                        ("&", chunk_node, chunk_idx, one),
+                        idx_ready,
+                    )
+                    selected = emit(
+                        "valu",
+                        (
+                            "multiply_add",
+                            chunk_node,
+                            chunk_node,
+                            depth1_delta_vec,
+                            depth1_right_vec,
+                        ),
+                        selected,
+                    )
+                    val_ready = emit(
+                        "valu",
+                        ("^", chunk_val, chunk_val, chunk_node),
+                        val_ready,
+                        selected,
+                    )
+                elif depth == 2 and LOOKUP_DEPTH >= 2:
+                    low_bit = emit(
+                        "valu",
+                        ("&", chunk_tmp1, chunk_idx, one),
+                        idx_ready,
+                    )
+                    low_half = emit(
+                        "valu",
+                        ("<", chunk_tmp2, chunk_idx, hash_constants[5]),
+                        idx_ready,
+                    )
+                    selected = emit(
+                        "valu",
+                        (
+                            "multiply_add",
+                            chunk_node,
+                            chunk_tmp2,
+                            depth2_vectors[1],
+                            depth2_vectors[0],
+                        ),
+                        low_half,
+                    )
+                    cross = emit(
+                        "valu",
+                        ("*", chunk_tmp2, chunk_tmp1, chunk_tmp2),
+                        low_bit,
+                        low_half,
+                        selected,
+                    )
+                    selected = emit(
+                        "valu",
+                        (
+                            "multiply_add",
+                            chunk_node,
+                            chunk_tmp1,
+                            depth2_vectors[2],
+                            chunk_node,
+                        ),
+                        selected,
+                        low_bit,
+                    )
+                    selected = emit(
+                        "valu",
+                        (
+                            "multiply_add",
+                            chunk_node,
+                            chunk_tmp2,
+                            depth2_vectors[3],
+                            chunk_node,
+                        ),
+                        selected,
+                        cross,
+                    )
+                    val_ready = emit(
+                        "valu",
+                        ("^", chunk_val, chunk_val, chunk_node),
+                        val_ready,
+                        selected,
+                    )
+                else:
+                    addr_ready = emit_scalar_vector(
+                        "+",
+                        chunk_node,
+                        forest_values_vec,
+                        chunk_idx,
+                        idx_ready,
+                    )
+                    node_loads = [
+                        emit(
+                            "load",
+                            ("load_offset", chunk_node, chunk_node, lane),
+                            addr_ready[lane],
+                        )
+                        for lane in range(VLEN)
+                    ]
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+                    val_ready = emit(
+                        "valu",
+                        ("^", chunk_val, chunk_val, chunk_node),
+                        val_ready,
+                        *node_loads,
+                    )
+                for op1, val1, op2, op3, val3 in HASH_STAGES:
+                    if (op1, op2, op3) == ("+", "+", "<<"):
+                        multiplier = 1 + (1 << val3)
+                        val_ready = emit(
+                            "valu",
+                            (
+                                "multiply_add",
+                                chunk_val,
+                                chunk_val,
+                                hash_constants[multiplier],
+                                hash_constants[val1],
+                            ),
+                            val_ready,
+                        )
+                    else:
+                        left = emit(
+                            "valu",
+                            (op1, chunk_tmp1, chunk_val, hash_constants[val1]),
+                            val_ready,
+                        )
+                        right = emit(
+                            "valu",
+                            (op3, chunk_tmp2, chunk_val, hash_constants[val3]),
+                            val_ready,
+                        )
+                        val_ready = emit(
+                            "valu",
+                            (op2, chunk_val, chunk_tmp1, chunk_tmp2),
+                            left,
+                            right,
+                        )
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+                # The final index is not part of the required output.  At the
+                # leaf, the next round is known to restart at the root.
+                if round_no == rounds - 1:
+                    continue
+                if round_no % (forest_height + 1) == forest_height:
+                    idx_ready = emit(
+                        "valu", ("^", chunk_idx, chunk_idx, chunk_idx), val_ready
+                    )
+                    continue
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+                # 2*idx + (1 if val is even else 2)
+                # == 2*idx + 1 + (val & 1), without a flow-engine select.
+                parity = emit_scalar_vector(
+                    "&", chunk_tmp1, chunk_val, one, val_ready
+                )
+                doubled = emit(
+                    "valu",
+                    ("multiply_add", chunk_idx, chunk_idx, two, one),
+                    val_ready,
+                    idx_ready,
+                )
+                idx_ready = emit(
+                    "valu", ("+", chunk_idx, chunk_idx, chunk_tmp1), parity, doubled
+                )
+
+            emit(
+                "store",
+                ("vstore", input_addrs + chunk_no, chunk_val),
+                val_ready,
+            )
+
+        self.schedule(ops)
 
 BASELINE = 147734
 
@@ -203,22 +637,18 @@ def do_kernel_test(
         trace=trace,
     )
     machine.prints = prints
-    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
-        machine.run()
-        inp_values_p = ref_mem[6]
-        if prints:
-            print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
-            print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
-        assert (
-            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
-            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-        ), f"Incorrect result on round {i}"
-        inp_indices_p = ref_mem[5]
-        if prints:
-            print(machine.mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-            print(ref_mem[inp_indices_p : inp_indices_p + len(inp.indices)])
-        # Updating these in memory isn't required, but you can enable this check for debugging
-        # assert machine.mem[inp_indices_p:inp_indices_p+len(inp.indices)] == ref_mem[inp_indices_p:inp_indices_p+len(inp.indices)]
+    machine.enable_pause = False
+    machine.run()
+    for ref_mem in reference_kernel2(mem, value_trace):
+        pass
+    inp_values_p = ref_mem[6]
+    if prints:
+        print(machine.mem[inp_values_p : inp_values_p + len(inp.values)])
+        print(ref_mem[inp_values_p : inp_values_p + len(inp.values)])
+    assert (
+        machine.mem[inp_values_p : inp_values_p + len(inp.values)]
+        == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
+    ), "Incorrect final values"
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
