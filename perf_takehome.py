@@ -37,11 +37,12 @@ from problem import (
 )
 
 
-LOOKUP_DEPTH = 2
-ALU_ROOT_CHUNKS = 28
+LOOKUP_DEPTH = 3
+ALU_ROOT_CHUNKS = 32
 ALU_INDEX_CHUNKS = 32
 SETUP_CHUNK = 32
-LOAD_ADDR_CHUNKS = 32
+HASH_ALU_CHUNKS = 2
+DEPTH3_SHARED_SELECT = True
 
 
 class KernelBuilder:
@@ -96,6 +97,11 @@ class KernelBuilder:
             return reads, set(range(slot[1], slot[1] + VLEN))
         if engine == "flow" and slot[0] == "add_imm":
             return {slot[2]}, {slot[1]}
+        if engine == "flow" and slot[0] == "vselect":
+            reads = set()
+            for addr in slot[2:5]:
+                reads.update(range(addr, addr + VLEN))
+            return reads, set(range(slot[1], slot[1] + VLEN))
         raise ValueError((engine, slot))
 
     def pack_setup(self, extract=False, setup_chunk=-1):
@@ -183,8 +189,16 @@ class KernelBuilder:
                 successors[dep].append(op_id)
 
         # Bottom level is a useful critical-path priority for unit-latency ops.
+        pending = dep_counts.copy()
+        topological = [i for i, count in enumerate(pending) if count == 0]
+        for op_id in topological:
+            for succ in successors[op_id]:
+                pending[succ] -= 1
+                if pending[succ] == 0:
+                    topological.append(succ)
+        assert len(topological) == len(ops), "Dependency cycle in scheduler"
         bottom_level = [1] * len(ops)
-        for op_id in range(len(ops) - 1, -1, -1):
+        for op_id in reversed(topological):
             if successors[op_id]:
                 bottom_level[op_id] = 1 + max(
                     bottom_level[succ] for succ in successors[op_id]
@@ -220,6 +234,7 @@ class KernelBuilder:
             raise ValueError(policy)
 
         def make_schedule(policy):
+            priorities = [priority(policy, op_id) for op_id in range(len(ops))]
             remaining = dep_counts.copy()
             ready = defaultdict(list)
             for op_id, count in enumerate(remaining):
@@ -235,7 +250,7 @@ class KernelBuilder:
                 for engine in engine_order:
                     candidates = ready[engine]
                     candidates.sort(
-                        key=lambda op_id: priority(policy, op_id), reverse=True
+                        key=priorities.__getitem__, reverse=True
                     )
                     selected = candidates[: SLOT_LIMITS[engine]]
                     del candidates[: len(selected)]
@@ -275,15 +290,17 @@ class KernelBuilder:
             "cohort_960",
             "cohort_1280",
         ) + tuple(f"cohort_{penalty}" for penalty in range(200, 461, 10)) + tuple(
-            f"cohort_{penalty}" for penalty in range(221, 250)
+            f"cohort_{penalty}" for penalty in range(221, 281)
         )
-        candidates = {policy: make_schedule(policy) for policy in policies}
-        self.schedule_stats = {
-            policy: len(bundles) for policy, bundles in candidates.items()
-        }
-        best_policy = min(policies, key=lambda policy: len(candidates[policy]))
-        self.schedule_policy = best_policy
-        self.instrs.extend(candidates[best_policy])
+        self.schedule_stats = {}
+        best = None
+        for policy in dict.fromkeys(policies):
+            bundles = make_schedule(policy)
+            self.schedule_stats[policy] = len(bundles)
+            if best is None or len(bundles) < len(best):
+                best = bundles
+                self.schedule_policy = policy
+        self.instrs.extend(best)
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -331,7 +348,7 @@ class KernelBuilder:
 
         one = vector_const(1, "one")
         two = vector_const(2, "two")
-        forest_values_vec = vector_const(forest_values_p, "forest_values_vec")
+        forest_values_scalar = self.scratch_const(forest_values_p, "forest_values_scalar")
         top_nodes = self.alloc_scratch("top_nodes", VLEN)
         self.add("load", ("vload", top_nodes, self.const_map[forest_values_p]))
         root_value = top_nodes
@@ -340,54 +357,51 @@ class KernelBuilder:
 
         depth1_left = top_nodes + 1
         depth1_right = top_nodes + 2
-        depth1_delta = self.alloc_scratch("depth1_delta")
-        self.add("alu", ("-", depth1_delta, depth1_left, depth1_right))
         depth1_right_vec = self.alloc_scratch("depth1_right_vec", VLEN)
-        depth1_delta_vec = self.alloc_scratch("depth1_delta_vec", VLEN)
+        depth1_left_vec = self.alloc_scratch("depth1_left_vec", VLEN)
         self.add("valu", ("vbroadcast", depth1_right_vec, depth1_right))
-        self.add("valu", ("vbroadcast", depth1_delta_vec, depth1_delta))
+        self.add("valu", ("vbroadcast", depth1_left_vec, depth1_left))
 
         depth2_values = [top_nodes + tree_idx for tree_idx in range(3, 7)]
-        depth2_deltas = []
-        for name, left, right in (
-            ("4_minus_6", 1, 3),
-            ("5_minus_6", 2, 3),
-            ("3_minus_4", 0, 1),
-        ):
-            delta = self.alloc_scratch(f"depth2_delta_{name}")
-            self.add(
-                "alu", ("-", delta, depth2_values[left], depth2_values[right])
-            )
-            depth2_deltas.append(delta)
-        # Bilinear cross coefficient:
-        # v3 - v4 - v5 + v6 == (v3 - v4) - (v5 - v6).
-        self.add(
-            "alu",
-            (
-                "-",
-                depth2_deltas[2],
-                depth2_deltas[2],
-                depth2_deltas[1],
-            ),
-        )
         depth2_vectors = []
-        for name, scalar in (
-            ("base_6", depth2_values[3]),
-            ("4_minus_6", depth2_deltas[0]),
-            ("5_minus_6", depth2_deltas[1]),
-            ("cross", depth2_deltas[2]),
-        ):
+        for name, scalar in enumerate(depth2_values):
             vector = self.alloc_scratch(f"depth2_vec_{name}", VLEN)
             self.add("valu", ("vbroadcast", vector, scalar))
             depth2_vectors.append(vector)
+
+        if LOOKUP_DEPTH >= 3:
+            depth3_addr = self.scratch_const(forest_values_p + 7, "depth3_addr")
+            # The setup hazard tracker delays this overwrite until all users of
+            # the first tree prefix have read it.
+            self.add("load", ("vload", top_nodes, depth3_addr))
+            depth3_vectors = []
+            for i in range(4):
+                vector = self.alloc_scratch(f"depth3_lower_{i}", VLEN)
+                self.add("valu", ("vbroadcast", vector, top_nodes + i))
+                depth3_vectors.append(vector)
+            a, b, c, d = [top_nodes + i for i in range(4, 8)]
+            if DEPTH3_SHARED_SELECT:
+                upper_scalars = tuple(enumerate((a, b, c, d)))
+            else:
+                for dest in (a, b, c):
+                    self.add("alu", ("-", dest, dest, d))
+                self.add("alu", ("-", a, a, b))
+                self.add("alu", ("-", a, a, c))
+                upper_scalars = (("base", d), ("delta4", b), ("delta5", c), ("cross", a))
+            for name, scalar in upper_scalars:
+                vector = self.alloc_scratch(f"depth3_upper_{name}", VLEN)
+                self.add("valu", ("vbroadcast", vector, scalar))
+                depth3_vectors.append(vector)
+            depth3_thresholds = {n: self.scratch_const(n) for n in (9, 11, 13)}
 
         hash_constants = {}
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             if val1 not in hash_constants:
                 hash_constants[val1] = vector_const(val1, f"const_{val1:x}")
             fused = (op1, op2, op3) == ("+", "+", "<<")
-            if (not fused or val3 == 5) and val3 not in hash_constants:
+            if not fused and val3 not in hash_constants:
                 hash_constants[val3] = vector_const(val3, f"const_{val3:x}")
+        five_scalar = self.scratch_const(5, "five_scalar")
         for op1, _val1, op2, op3, shift in HASH_STAGES:
             if (op1, op2, op3) == ("+", "+", "<<"):
                 multiplier = 1 + (1 << shift)
@@ -406,9 +420,11 @@ class KernelBuilder:
         node_or_addr = self.alloc_scratch("node_or_addr", batch_size)
         tmp1 = self.alloc_scratch("tmp1", batch_size)
         tmp2 = self.alloc_scratch("tmp2", batch_size)
-        input_addrs = self.alloc_scratch("input_addrs", chunk_count)
+        input_addrs = node_or_addr
 
         ops = setup_ops
+        setup_count = len(setup_ops)
+        shared_select_uses = []
         emit_context = {"chunk": -1, "round": -1, "local_seq": 0}
 
         def emit(engine, slot, *deps):
@@ -440,29 +456,17 @@ class KernelBuilder:
                 for lane in range(VLEN)
             ]
 
-        input_addr_ready = [emit("load", ("const", input_addrs, inp_values_p))]
-        for chunk_no in range(1, chunk_count):
-            if chunk_no < LOAD_ADDR_CHUNKS:
-                ready = emit(
-                    "load",
-                    (
-                        "const",
-                        input_addrs + chunk_no,
-                        inp_values_p + chunk_no * VLEN,
-                    ),
-                )
-            else:
-                ready = emit(
-                    "flow",
-                    (
-                        "add_imm",
-                        input_addrs + chunk_no,
-                        input_addrs,
-                        chunk_no * VLEN,
-                    ),
-                    input_addr_ready[0],
-                )
-            input_addr_ready.append(ready)
+        def select(dest, cond, left, right, *deps):
+            return emit("flow", ("vselect", dest, cond, left, right), *deps)
+
+        # These addresses die at the input vload, so node buffers can hold them.
+        # Keep constants independent: deriving them from chunk 0 would require
+        # anti-dependencies before that chunk reuses its node buffer.
+        input_addr_ready = [
+            emit("load", ("const", input_addrs + chunk_no * VLEN,
+                          inp_values_p + chunk_no * VLEN))
+            for chunk_no in range(chunk_count)
+        ]
 
         for chunk_no in range(chunk_count):
             emit_context.update(chunk=chunk_no, round=-1, local_seq=0)
@@ -475,10 +479,10 @@ class KernelBuilder:
 
             val_ready = emit(
                 "load",
-                ("vload", chunk_val, input_addrs + chunk_no),
+                ("vload", chunk_val, input_addrs + offset),
                 input_addr_ready[chunk_no],
             )
-            idx_ready = None  # Scratch is zero-initialized, matching Input.generate.
+            idx_ready = None  # At the root, the index is implicit, not read.
 
             for round_no in range(rounds):
                 emit_context["round"] = round_no
@@ -500,15 +504,8 @@ class KernelBuilder:
                         ("&", chunk_node, chunk_idx, one),
                         idx_ready,
                     )
-                    selected = emit(
-                        "valu",
-                        (
-                            "multiply_add",
-                            chunk_node,
-                            chunk_node,
-                            depth1_delta_vec,
-                            depth1_right_vec,
-                        ),
+                    selected = select(
+                        chunk_node, chunk_node, depth1_left_vec, depth1_right_vec,
                         selected,
                     )
                     val_ready = emit(
@@ -518,63 +515,78 @@ class KernelBuilder:
                         selected,
                     )
                 elif depth == 2 and LOOKUP_DEPTH >= 2:
-                    low_bit = emit(
-                        "valu",
-                        ("&", chunk_tmp1, chunk_idx, one),
-                        idx_ready,
+                    low_bit = emit_scalar_vector(
+                        "&", chunk_tmp1, chunk_idx, one, idx_ready
                     )
-                    low_half = emit(
-                        "valu",
-                        ("<", chunk_tmp2, chunk_idx, hash_constants[5]),
-                        idx_ready,
+                    left = select(
+                        chunk_node, chunk_tmp1, depth2_vectors[0], depth2_vectors[1], low_bit
                     )
-                    selected = emit(
-                        "valu",
-                        (
-                            "multiply_add",
-                            chunk_node,
-                            chunk_tmp2,
-                            depth2_vectors[1],
-                            depth2_vectors[0],
-                        ),
-                        low_half,
+                    right = select(
+                        chunk_tmp2, chunk_tmp1, depth2_vectors[2], depth2_vectors[3], low_bit
                     )
-                    cross = emit(
-                        "valu",
-                        ("*", chunk_tmp2, chunk_tmp1, chunk_tmp2),
-                        low_bit,
-                        low_half,
-                        selected,
-                    )
-                    selected = emit(
-                        "valu",
-                        (
-                            "multiply_add",
-                            chunk_node,
-                            chunk_tmp1,
-                            depth2_vectors[2],
-                            chunk_node,
-                        ),
-                        selected,
-                        low_bit,
-                    )
-                    selected = emit(
-                        "valu",
-                        (
-                            "multiply_add",
-                            chunk_node,
-                            chunk_tmp2,
-                            depth2_vectors[3],
-                            chunk_node,
-                        ),
-                        selected,
-                        cross,
+                    low_half = [
+                        emit(
+                            "alu", ("<", chunk_tmp1 + lane, chunk_idx + lane, five_scalar),
+                            left, right,
+                        )
+                        for lane in range(VLEN)
+                    ]
+                    selected = select(
+                        chunk_node, chunk_tmp1, chunk_node, chunk_tmp2, low_half, left, right
                     )
                     val_ready = emit(
                         "valu",
                         ("^", chunk_val, chunk_val, chunk_node),
                         val_ready,
                         selected,
+                    )
+                elif depth == 3 and LOOKUP_DEPTH >= 3:
+                    def mask(op, scalar, *deps):
+                        return [
+                            emit("alu", (op, chunk_tmp1 + lane, chunk_idx + lane, scalar), *deps)
+                            for lane in range(VLEN)
+                        ]
+
+                    odd = mask("&", self.const_map[1], idx_ready)
+                    lower_left = select(
+                        chunk_node, chunk_tmp1, depth3_vectors[0], depth3_vectors[1], odd
+                    )
+                    lower_right = select(
+                        chunk_tmp2, chunk_tmp1, depth3_vectors[2], depth3_vectors[3], odd
+                    )
+                    lower_half = mask("<", depth3_thresholds[9], lower_left, lower_right)
+                    lower = select(
+                        chunk_node, chunk_tmp1, chunk_node, chunk_tmp2,
+                        lower_half, lower_left, lower_right,
+                    )
+                    odd = mask("&", self.const_map[1], lower)
+                    if DEPTH3_SHARED_SELECT:
+                        upper_left = select(
+                            chunk_tmp2, chunk_tmp1, depth3_vectors[4], depth3_vectors[5],
+                            odd, lower,
+                        )
+                        upper_right = select(
+                            top_nodes, chunk_tmp1, depth3_vectors[6], depth3_vectors[7],
+                            odd, list(range(setup_count)),
+                        )
+                        upper_half = mask("<", depth3_thresholds[13], upper_left, upper_right)
+                        upper = select(
+                            chunk_tmp2, chunk_tmp1, chunk_tmp2, top_nodes,
+                            upper_half, upper_left, upper_right,
+                        )
+                        shared_select_uses.append((round_no, chunk_no, upper_right, upper))
+                    else:
+                        upper = emit("valu", ("multiply_add", chunk_tmp2, chunk_tmp1, depth3_vectors[7], depth3_vectors[5]), odd, lower)
+                        upper_half = mask("<", depth3_thresholds[13], upper)
+                        upper = emit("valu", ("multiply_add", chunk_tmp2, chunk_tmp1, chunk_tmp2, depth3_vectors[4]), upper_half, upper)
+                        odd = mask("&", self.const_map[1], upper)
+                        upper = emit("valu", ("multiply_add", chunk_tmp2, chunk_tmp1, depth3_vectors[6], chunk_tmp2), odd, upper)
+                    half = mask("<", depth3_thresholds[11], upper)
+                    selected = select(
+                        chunk_node, chunk_tmp1, chunk_node, chunk_tmp2, half, upper, lower
+                    )
+                    val_ready = emit(
+                        "valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected
                     )
                 else:
                     addr_ready = [
@@ -583,7 +595,7 @@ class KernelBuilder:
                             (
                                 "+",
                                 chunk_node + lane,
-                                forest_values_vec + lane,
+                                forest_values_scalar,
                                 chunk_idx + lane,
                             ),
                             idx_ready[lane]
@@ -622,11 +634,16 @@ class KernelBuilder:
                             val_ready,
                         )
                     else:
-                        left = emit(
-                            "valu",
-                            (op1, chunk_tmp1, chunk_val, hash_constants[val1]),
-                            val_ready,
-                        )
+                        if chunk_no < HASH_ALU_CHUNKS and val3 == 19:
+                            left = emit_scalar_vector(
+                                op1, chunk_tmp1, chunk_val, hash_constants[val1], val_ready
+                            )
+                        else:
+                            left = emit(
+                                "valu",
+                                (op1, chunk_tmp1, chunk_val, hash_constants[val1]),
+                                val_ready,
+                            )
                         right = emit(
                             "valu",
                             (op3, chunk_tmp2, chunk_val, hash_constants[val3]),
@@ -644,9 +661,9 @@ class KernelBuilder:
                 if round_no == rounds - 1:
                     continue
                 if round_no % (forest_height + 1) == forest_height:
-                    idx_ready = emit(
-                        "valu", ("^", chunk_idx, chunk_idx, chunk_idx), val_ready
-                    )
+                    # The root does not read an index, and its child index is
+                    # rebuilt from parity. No physical zero/reset is needed.
+                    idx_ready = None
                     continue
 
                 # 2*idx + (1 if val is even else 2)
@@ -654,12 +671,17 @@ class KernelBuilder:
                 parity = emit_scalar_vector(
                     "&", chunk_tmp1, chunk_val, one, val_ready
                 )
-                doubled = emit(
-                    "valu",
-                    ("multiply_add", chunk_idx, chunk_idx, two, one),
-                    val_ready,
-                    idx_ready,
-                )
+                if depth == 0:
+                    doubled = None
+                    index_base = one
+                else:
+                    doubled = emit(
+                        "valu",
+                        ("multiply_add", chunk_idx, chunk_idx, two, one),
+                        val_ready,
+                        idx_ready,
+                    )
+                    index_base = chunk_idx
                 if chunk_no < ALU_INDEX_CHUNKS:
                     idx_ready = [
                         emit(
@@ -667,7 +689,7 @@ class KernelBuilder:
                             (
                                 "+",
                                 chunk_idx + lane,
-                                chunk_idx + lane,
+                                index_base + lane,
                                 chunk_tmp1 + lane,
                             ),
                             parity[lane],
@@ -678,17 +700,32 @@ class KernelBuilder:
                 else:
                     idx_ready = emit(
                         "valu",
-                        ("+", chunk_idx, chunk_idx, chunk_tmp1),
+                        ("+", chunk_idx, index_base, chunk_tmp1),
                         parity,
                         doubled,
                     )
 
-            emit(
-                "store",
-                ("vstore", input_addrs + chunk_no, chunk_val),
+            store_addr = emit(
+                "flow",
+                ("add_imm", chunk_node, forest_values_scalar, inp_values_p + offset - forest_values_p),
                 val_ready,
             )
+            emit(
+                "store",
+                ("vstore", chunk_node, chunk_val),
+                val_ready,
+                store_addr,
+            )
 
+        previous_use = None
+        # Only the upper-right pair uses this one shared vector. Release it as
+        # soon as the upper quartet is selected. Descending chunk order matches
+        # the cohort scheduler, avoiding a backwards chain through the wavefront.
+        # All setup consumers finish before the first overwrite (explicit deps).
+        for _, _, writer, reader in sorted(shared_select_uses, key=lambda item: (item[0], -item[1])):
+            if previous_use is not None:
+                ops[writer]["deps"].append(previous_use)
+            previous_use = reader
         self.schedule(ops)
 
 BASELINE = 147734

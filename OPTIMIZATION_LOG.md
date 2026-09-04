@@ -421,3 +421,131 @@ Final v2 result:
 - `git diff --check`: pass.
 
 Final insight: after scheduling brought the kernel near its load floor, a small data-layout observation—seven adjacent tree nodes—was worth more than another scheduler tweak. One vector load removed eleven load-engine slots and six measured cycles.
+
+## Iteration 8 — September 3: move beyond the gather-load floor
+
+Starting checkpoint: `a37a926`, 1,354 cycles, 1,515 scratch words.
+Recounted issue slots: ALU 10,181; VALU 7,614; load 2,640; store 32.
+The load floor alone is 1,320 cycles, so scheduling cannot produce a large gain.
+
+### 8a. Pool shallow-lookup temporaries — rejected
+
+Experiment: alias the hash's second temporary with the dead node value, then
+share the extra shallow-lookup temporary among chunks. Add explicit RAW/WAR/WAW
+edges in round-major order to make the sharing safe.
+
+Pool size / cycles: 8 / 1,490; 16 / 1,423; 24 / 1,391; 28 / 1,373;
+32 / 1,354. The first candidate passed the local reference comparison.
+Rejected all pooled variants: memory savings introduce cross-chunk waiting.
+
+### 8b. Reclaim scratch without cross-chunk sharing — retained prerequisite
+
+- Put input addresses in each chunk's node buffer before traversal.
+- Reconstruct output addresses there with flow `add_imm` after the final hash.
+- Replace the forest-address broadcast with a scalar constant used by ALU.
+- Replace the depth-2 comparison's broadcast constant with scalar ALU comparisons.
+
+Depth-2-only result: 1,356 cycles; local reference comparison passed.
+This tiny regression is a prerequisite for the next experiment: enough space
+for eight more tree-node/coefficient vectors, without serializing chunks.
+
+### 8c. Depth-3 hybrid register lookup — retained
+
+Load nodes 7–14 with one contiguous `vload`, reusing the setup prefix buffer
+after its earlier consumers finish. Represent the lower four nodes directly
+and the upper four as bilinear coefficients. Use three flow `vselect`s for
+the lower half, three VALU multiply-adds for the upper half, and a final flow
+selection; scalar ALU builds the masks. This fits the existing three temporary
+vectors per chunk and does not require inter-chunk scratch sharing.
+
+- Local reference comparison: passed.
+- Cycles: 1,323, with `cohort_430`.
+- Scratch: 1,534 / 1,536 words.
+- Slots: ALU 13,258; VALU 7,748; load 2,132; flow 288; store 32.
+- Removes 512 gather loads, with four net extra setup load slots.
+
+Insight: a pure memory reduction is not sufficient. The lookup deliberately
+splits its work across ALU, flow, and VALU; otherwise the replacement arithmetic
+would simply become a larger bottleneck. VALU is now the leading resource floor
+(ceil(7,748 / 6) = 1,292 cycles), not load (1,066 cycles).
+
+### 8d. Partial hash offload and implicit root indices
+
+Offload only the constant-XOR arm of hash stage 1 to scalar ALU for the first
+N chunks. With the hybrid lookup, N = 0 / 4 / 8 / 12 / 16 / 20 produced
+1,323 / 1,316 / 1,314 / 1,309 / 1,320 / 1,360 cycles. Local correctness passed.
+
+Remove the leaf's explicit index-zero operation and rebuild the root's child
+index as `1 + parity`, instead of doubling a known zero. Removes 96 VALU slots
+in the submission shape; the 12-chunk hash-offload candidate reaches 1,296.
+The implicit index is never read before it is reconstructed.
+
+### 8e. Move depth-2 lookup to flow
+
+Use four raw node vectors, scalar masks, and three `vselect`s rather than
+bilinear interpolation. Retune the hash offload because the VALU/ALU balance
+changed: N = 0 / 4 / 8 / 12 gives 1,267 / 1,269 / 1,279 / 1,320 cycles.
+Retain the lookup, but undo the now-excessive hash offload.
+
+### 8f. Share only a short-lived depth-3 intermediate
+
+Reuse the dead setup prefix buffer for the upper-right pair of the depth-3
+selection tree. Its lifetime ends as soon as the upper quartet is selected;
+unlike 8a, it does not span the entire lookup. Add explicit dependencies from
+all setup operations and between each shared writer and the preceding reader.
+Order reuse by round and descending chunk number, matching the cohort priority.
+The scheduler now computes bottom levels using an actual topological ordering,
+since these new dependencies can point to operations emitted later.
+
+This enables seven flow selections with no interpolation FMAs. Result: 1,242
+cycles; official submission suite passed 9/9. Root/hash offload tuning then
+reached 1,238 (root 32 chunks, hash 4 chunks).
+
+Insight: scratch sharing is not categorically bad. The length of the shared
+value's lifetime and the direction of its dependency chain decide whether it
+creates pipeline stalls. The same eight-word setup buffer is used successively
+for shallow-node loading, depth-3 loading, and the short-lived selection result.
+
+### 8g. Depth-1 flow selection and final tuning
+
+Replace the depth-1 interpolation FMA with flow `vselect`, keeping its parity
+mask vectorized. Remove the now-unused scalar delta. Sweep root/hash offload
+and index-addition placement using `tune_kernel.py`; every candidate is checked
+against the frozen simulator and reference, not just counted statically.
+
+- Root/hash/index = 32/2/32: 1,231 cycles, retained.
+- 32/6/28 and 32/6/32 also reach 1,231; prefer the lower offload count.
+- Moving index additions back to VALU: 32/2/24 gives 1,244; 32/2/28 gives 1,235.
+- Extend the cohort scan to include every penalty from 221 through 280;
+  retained policy is `cohort_260`.
+- Cache scheduling priorities and keep only the best schedule in memory;
+  this reduces host build overhead, independently of simulated cycles.
+- Remove the old mixed input-address-generation switch: after buffer reuse,
+  deriving later addresses from chunk 0 would need additional anti-dependencies.
+
+Final candidate: 1,231 cycles, 1,530 / 1,536 scratch words. Slots: load 2,132;
+VALU 7,036; ALU 13,568; flow 736; store 32. Resource floors are 1,066 / 1,173 /
+1,131 / 736 / 16 cycles respectively. The remaining 58-cycle gap above the VALU
+floor is a scheduling/latency target, not proof that this lower bound is attainable.
+
+Overall: 1,354 → 1,231 cycles (123 fewer, 9.08% reduction), 120.01x the original
+147,734-cycle baseline. No simulator or submission-test changes.
+
+Final verification completed:
+
+- Official `tests/submission_tests.py`: 9/9 pass, consistently 1,231 cycles.
+- Frozen simulator/reference: 32 additional seeds (0–31) pass on the scored shape.
+- Extra `(height, rounds, batch)` shapes `(3,1,8)`, `(3,4,16)`, `(3,9,64)`,
+  `(4,12,64)`, `(10,22,256)`: all pass seeds 0, 1, and 123.
+- `git diff origin/main -- tests/ problem.py`: empty.
+- `git diff --check`: pass.
+- Changes remain local on `optimize/kernel-v2`; no commit or push in this round.
+
+Reproduce final tuning/validation:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 tests/submission_tests.py
+PYTHONDONTWRITEBYTECODE=1 python3 tune_kernel.py --hash-alu-chunks 2 6 --alu-index-chunks 24 28 32
+git diff origin/main -- tests/ problem.py
+git diff --check
+```
