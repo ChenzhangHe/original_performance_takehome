@@ -1,7 +1,7 @@
 """Reproducible local tuning; validate every candidate with the frozen simulator.
 
 Example:
-    python tune_kernel.py --hash-alu-chunks 0 4 8 12 --alu-root-chunks 24 28 32
+    python tune_kernel.py --hash-alu-chunks 0 4 8 12
 Does not modify the kernel, simulator, tests, or input data.
 """
 
@@ -39,13 +39,17 @@ def check(builder, seed, height=10, rounds=16, batch=256):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("HASH_ALU_CHUNKS", "ALU_ROOT_CHUNKS", "ALU_INDEX_CHUNKS"):
+    for name in (
+        "HASH_ALU_CHUNKS", "BIT_MASK_VALU_CHUNKS", "ALU_INDEX_CHUNKS",
+    ):
         parser.add_argument("--" + name.lower().replace("_", "-"), type=int, nargs="+", default=[getattr(kernel, name)])
     parser.add_argument("--seeds", type=int, nargs="+", default=[123])
     args = parser.parse_args()
-    for hash_chunks, root_chunks, index_chunks in product(args.hash_alu_chunks, args.alu_root_chunks, args.alu_index_chunks):
+    for hash_chunks, bit_mask_chunks, index_chunks in product(
+        args.hash_alu_chunks, args.bit_mask_valu_chunks, args.alu_index_chunks,
+    ):
         kernel.HASH_ALU_CHUNKS = hash_chunks
-        kernel.ALU_ROOT_CHUNKS = root_chunks
+        kernel.BIT_MASK_VALU_CHUNKS = bit_mask_chunks
         kernel.ALU_INDEX_CHUNKS = index_chunks
         start = time.perf_counter()
         builder = kernel.KernelBuilder()
@@ -56,7 +60,8 @@ def main():
         slots = Counter()
         for bundle in builder.instrs:
             slots.update({engine: len(ops) for engine, ops in bundle.items()})
-        print(json.dumps(dict(hash_chunks=hash_chunks, root_chunks=root_chunks, index_chunks=index_chunks,
+        print(json.dumps(dict(hash_chunks=hash_chunks,
+                              bit_mask_chunks=bit_mask_chunks, index_chunks=index_chunks,
                               cycles=cycles, scratch=builder.scratch_ptr, policy=builder.schedule_policy,
                               slots=dict(slots), checked_seeds=args.seeds, build_seconds=round(elapsed, 3))), flush=True)
 

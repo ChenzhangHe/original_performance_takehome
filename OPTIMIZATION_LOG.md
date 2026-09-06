@@ -549,3 +549,125 @@ PYTHONDONTWRITEBYTECODE=1 python3 tune_kernel.py --hash-alu-chunks 2 6 --alu-ind
 git diff origin/main -- tests/ problem.py
 git diff --check
 ```
+
+## Iteration 9 — September 5: address representation and encoded hashes
+
+Starting checkpoint: `563b40b`, 1,231 cycles, 1,530 scratch words.
+
+### 9a. Profile the remaining gap
+
+At 1,231 cycles, total slots and resource floors were:
+
+- load 2,132 → 1,066 cycles; VALU 7,036 → 1,173 cycles;
+- ALU 13,568 → 1,131 cycles; flow 736 → 736 cycles.
+
+VALU occupancy was 99.5% from cycles 100–1,130, but only 57.3% in the last
+100 cycles. The remaining gap is therefore a combination of work count and an
+underfilled software-pipeline tail.
+
+Two read-only dependency/scheduling probes were rejected:
+
+- Relax the hash dependency on 384 index FMAs: 1,233 cycles (8 seeds pass).
+- Switch directly to critical-path priority in the tail: no useful gain; most
+  switch points regress substantially. Dependency freedom is useful only if
+  the scheduler can exploit it.
+
+### 9b. Keep tree addresses rather than logical indices — retained
+
+Represent traversal state as `address = forest_values_p + index`. For all
+non-root updates:
+
+```text
+address_next = 2 * address - 6 + parity
+```
+
+This removes 2,048 scalar address additions in eight gather rounds. Adjust all
+shallow-lookup masks and thresholds for the shifted representation, and rebuild
+the root child as address `8 + parity`. Preserve the root value in one scalar
+instead of an eight-word broadcast, making room for the new vector bias.
+
+- Correctness: local frozen reference passes.
+- Address-only checkpoint: 1,224 cycles.
+- Scratch: 1,534 / 1,536 before later encoding cleanup.
+
+The direct gain is modest because VALU remains the bottleneck. The main value
+is freeing enough ALU capacity to move hash work off VALU. Rebalancing the
+stage-1 constant-XOR arm across 18 chunks reaches 1,205 cycles. Moving an equal
+amount from the final hash stage is better: 1,202 cycles.
+
+### 9c. Carry an encoded hash between rounds — retained
+
+The final hash stage is:
+
+```text
+hash = x ^ (x >> 16) ^ C
+```
+
+Carry `encoded = hash ^ C = x ^ (x >> 16)` internally. Pre-XOR the register-
+resident shallow nodes with `C`; XOR gathered nodes with `C` using freed scalar
+ALU capacity. Since `C` is odd, update child addresses using inverted parity:
+
+```text
+root child  = 9 - (encoded & 1)
+next address = 2 * address - 5 - (encoded & 1)
+```
+
+Round 0 uses the raw root; later root rounds use the encoded root. Initially
+decoding every final output with eight scalar XORs produced 1,193 cycles.
+
+On the last round, emit the ordinary three-operation final hash stage instead;
+the output is already decoded and 256 scalar output XORs disappear. This uses
+an eight-word final-constant vector but still fits scratch.
+
+### 9d. Shared-buffer and gather-XOR alternatives — rejected
+
+- Two depth-3 shared selection buffers instead of one: 1,194 versus 1,193.
+  Removing one serialization chain does not offset its changed ready-work order.
+- Offload gather/node XORs lane-by-lane and reduce final-stage offload by an
+  equal resource amount: 1,216 / 1,215 / 1,204 for representative mixes;
+  the original vector gather XOR is retained.
+
+### 9e. Two-phase tail scheduler — retained
+
+Run the existing soft cohort pipeline initially, then switch late in execution
+to a laggard policy that prioritizes lower-numbered, less-advanced chunks.
+Critical-path and round-first tail policies regress; explicitly catching up the
+laggards shortens the underfilled tail.
+
+Search cohort penalty 200–240 and switch cycles 1,000–1,040. Best retained
+policy is `tail_laggard_224_1034`.
+
+### 9f. Final-round decoding and mask rebalance — retained
+
+Instead of decoding 32 output vectors with 256 scalar XORs, emit the ordinary
+three-VALU final hash only in the last round. Earlier rounds remain encoded.
+This moves 256 slots off the near-saturated ALU in exchange for only 32 VALU
+slots. Retune the two-phase scheduler.
+
+Finally move the six depth-2/depth-3 bit masks for one chunk from scalar ALU to
+VALU. Zero / one / two chunks give 1,176 / 1,172 / 1,176 cycles respectively;
+one chunk best balances the issue engines. Moving an entire chunk's 14 parity
+masks to VALU ties at 1,172 and is rejected as needless complexity.
+
+Additional rejected checks:
+
+- Add a third scheduling phase after the laggard phase: no candidate improves
+  1,172; returning to critical, round-first, or cohort priority all tie/regress.
+- Move gathered-node XOR from VALU to per-lane ALU: 1,177 for one chunk.
+- Encode gathered nodes with VALU instead of per-lane ALU: ties at 1,172, both
+  with and without the six-mask transfer; retain the smaller transfer.
+
+Final iteration-9 candidate:
+
+- Cycles: 1,172 (59 fewer than 1,231; 4.79%; 126.05x baseline).
+- Scratch: 1,534 / 1,536 words.
+- Selected policy: `tail_laggard_240_1038`.
+- Static slots/floors: load 2,133/1,067; VALU 6,594/1,099;
+  ALU 13,281/1,107; flow 736/736; store 32/16.
+- Official `tests/submission_tests.py`: 9/9 pass, consistently 1,172 cycles.
+- Frozen simulator/reference: 32 additional seeds pass on the scored shape.
+- Extra `(height, rounds, batch)` shapes `(3,1,8)`, `(3,4,16)`, `(3,9,64)`,
+  `(4,12,64)`, and `(10,22,256)` pass seeds 0, 1, and 123.
+- `git diff origin/main -- tests/ problem.py`: empty; `git diff --check`: pass.
+- Retain only the winning tail candidate after the search; official suite host
+  runtime returns from about 10 seconds to 3.8 seconds without changing cycles.
