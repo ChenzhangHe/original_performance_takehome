@@ -231,7 +231,7 @@ class KernelBuilder:
             if policy.startswith("cohort_"):
                 penalty = int(policy.split("_")[1])
                 return (chunk_no * 100 - round_no * penalty, local_seq)
-            if policy.startswith("tail_laggard_"):
+            if policy.startswith("tail_"):
                 penalty = int(policy.split("_")[2])
                 return (chunk_no * 100 - round_no * penalty, local_seq)
             raise ValueError(policy)
@@ -252,8 +252,15 @@ class KernelBuilder:
                 bundle = {}
                 for engine in engine_order:
                     candidates = ready[engine]
-                    if policy.startswith("tail_laggard_") and len(bundles) >= int(
-                        policy.rsplit("_", 1)[1]
+                    tail_engines = (
+                        {"valu", "alu", "flow"}
+                        if policy.startswith("tail_compute_")
+                        else set(engine_order)
+                    )
+                    if (
+                        policy.startswith("tail_")
+                        and engine in tail_engines
+                        and len(bundles) >= int(policy.rsplit("_", 1)[1])
                     ):
                         candidates.sort(
                             key=lambda op_id: (
@@ -304,7 +311,7 @@ class KernelBuilder:
             "cohort_1280",
         ) + tuple(f"cohort_{penalty}" for penalty in range(200, 461, 10)) + tuple(
             f"cohort_{penalty}" for penalty in range(221, 281)
-        ) + ("tail_laggard_240_1038",)
+        ) + ("tail_laggard_240_1038", "tail_compute_245_960")
         self.schedule_stats = {}
         best = None
         for policy in dict.fromkeys(policies):
@@ -354,8 +361,17 @@ class KernelBuilder:
         inp_values_p = forest_values_p + n_nodes + batch_size
 
         def vector_const(value, name):
-            scalar = self.scratch_const(value, f"{name}_scalar")
-            vector = self.alloc_scratch(name, VLEN)
+            if value in self.const_map:
+                scalar = self.const_map[value]
+                vector = self.alloc_scratch(name, VLEN)
+            else:
+                # Lane 0 holds the scalar before the broadcast, then remains a
+                # valid scalar alias of the vector constant. This saves one
+                # scratch word for every new vector constant.
+                vector = self.alloc_scratch(name, VLEN)
+                scalar = vector
+                self.add("load", ("const", scalar, value))
+                self.const_map[value] = scalar
             self.add("valu", ("vbroadcast", vector, scalar))
             return vector
 

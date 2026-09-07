@@ -671,3 +671,49 @@ Final iteration-9 candidate:
 - `git diff origin/main -- tests/ problem.py`: empty; `git diff --check`: pass.
 - Retain only the winning tail candidate after the search; official suite host
   runtime returns from about 10 seconds to 3.8 seconds without changing cycles.
+
+## Iteration 10 — September 7: engine-specific tail scheduling
+
+Starting checkpoint: `aaa4080`, 1,172 cycles.
+
+### 10a. Apply laggard priority only to compute engines — retained
+
+The previous tail phase reordered every engine. Search subsets of engines and
+switch points while preserving the same instruction DAG. The best subset is
+VALU + ALU + flow; load and store retain the normal cohort ordering. Switching
+at cycle 980 initially reaches 1,169 cycles and passes 8 frozen-reference seeds.
+
+Fine search over pre-tail cohort penalties 230–250 and switch points 960–1,000
+finds a broad 1,168-cycle plateau. Retain the canonical policy
+`tail_compute_245_960`; keep the older all-engine tail policy as a fallback for
+other input shapes.
+
+Insight: the memory pipeline already has the right request order. Reordering
+loads to chase a lagging chunk disrupts useful prefetch overlap; only compute
+engines should drain the laggard's now-ready work.
+
+### 10b. Alias vector constants with their scalar lane — retained
+
+For a new vector constant, load its value directly into lane 0 of the allocated
+eight-word vector, then broadcast in place. Lane 0 remains the scalar alias.
+This removes one scratch word per unique vector constant with identical setup
+instruction count and no cycle change.
+
+- Scratch: 1,534 → 1,522 words.
+- Cycles remain 1,168 after final scheduler tuning.
+
+Rejected uses of the freed scratch:
+
+- Move one complete comparison class from ALU to VALU and compensate with hash
+  offload: thresholds 12 / 16 / 18 / 20 yield 1,184 / 1,179 / 1,179 / 1,177.
+- Add a second shared depth-3 selection buffer: ties at 1,169 before final tuning.
+
+Final iteration-10 candidate: 1,168 cycles, four fewer than `aaa4080` and
+126.48x the original 147,734-cycle baseline.
+
+Final verification:
+
+- Official `tests/submission_tests.py`: 9/9 pass, consistently 1,168 cycles.
+- Frozen simulator/reference: 32 additional seeds pass on the scored shape.
+- Five extra `(height, rounds, batch)` shapes pass seeds 0, 1, and 123.
+- `git diff origin/main -- tests/ problem.py`: empty; `git diff --check`: pass.
