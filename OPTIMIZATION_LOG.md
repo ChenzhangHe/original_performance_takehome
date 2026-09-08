@@ -669,6 +669,59 @@ Final iteration-9 candidate:
 - Extra `(height, rounds, batch)` shapes `(3,1,8)`, `(3,4,16)`, `(3,9,64)`,
   `(4,12,64)`, and `(10,22,256)` pass seeds 0, 1, and 123.
 - `git diff origin/main -- tests/ problem.py`: empty; `git diff --check`: pass.
+
+## Iteration 11 — September 8: heterogeneous pipeline pacing
+
+Starting checkpoint: `3b742f9`, 1,168 cycles, 1,522 scratch words.
+
+### 11a. Per-engine cohort penalties — retained
+
+The cohort scheduler previously applied one round penalty to every issue
+engine. Capture the same operation DAG and search independent penalties for
+load, VALU, ALU, and flow, plus the compute-only laggard switch point. Every
+candidate schedule is checked against the frozen simulator before retention.
+
+Random search first reached 1,158 cycles with `(300, 240, 240, 300, 900)`.
+Coordinate descent improved this to:
+
+```text
+load penalty = 360
+VALU penalty = 240
+ALU penalty  = 240
+flow penalty = 220
+laggard switch = cycle 900 (VALU, ALU, flow only)
+```
+
+Result: 1,156 cycles; 16 frozen-reference seeds pass during tuning. Retain the
+policy as `tail_hetero_360_240_240_220_900` while preserving the earlier
+policies as fallbacks for other shapes.
+
+Insight: load must run much farther ahead than arithmetic to sustain gathers,
+while flow should stay closer to the arithmetic wavefront. A single cohort
+penalty hid this difference.
+
+### 11b. Initialization and resource-rebalancing checks — rejected
+
+- Change setup pseudo-chunk priority: setup chunks 0 / 8 / 16 / 24 / 28 give
+  1,233 / 1,218 / 1,165 / 1,162 / 1,161; values 30–32 tie at 1,156.
+- Prioritize setup by bottom-level criticality: 1,159.
+- Generate input addresses through flow from one persistent base: 1,163.
+- Add a second depth-3 shared buffer: ties at 1,169 before heterogeneous tuning.
+- Move a whole comparison class to VALU and compensate with hash offload:
+  thresholds 12 / 16 / 18 / 20 give 1,184 / 1,179 / 1,179 / 1,177.
+- Move bit masks to VALU for 0 / 1 / 2 / 3 / 4 chunks: 1,163 / 1,156 /
+  1,160 / 1,162 / 1,160; retain one chunk.
+
+Final iteration-11 candidate: 1,156 cycles, 12 fewer than `3b742f9`, with
+scratch unchanged at 1,522 / 1,536 words. Relative to the original baseline,
+speedup is 127.80x.
+
+Final verification:
+
+- Official `tests/submission_tests.py`: 9/9 pass, consistently 1,156 cycles.
+- Frozen simulator/reference: 32 additional seeds pass on the scored shape.
+- Five extra `(height, rounds, batch)` shapes pass seeds 0, 1, and 123.
+- `git diff origin/main -- tests/ problem.py`: empty; `git diff --check`: pass.
 - Retain only the winning tail candidate after the search; official suite host
   runtime returns from about 10 seconds to 3.8 seconds without changing cycles.
 

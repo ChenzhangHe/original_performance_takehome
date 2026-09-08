@@ -231,6 +231,15 @@ class KernelBuilder:
             if policy.startswith("cohort_"):
                 penalty = int(policy.split("_")[1])
                 return (chunk_no * 100 - round_no * penalty, local_seq)
+            if policy.startswith("tail_hetero_"):
+                fields = policy.split("_")
+                penalty = {
+                    "load": int(fields[2]),
+                    "valu": int(fields[3]),
+                    "alu": int(fields[4]),
+                    "flow": int(fields[5]),
+                }.get(ops[op_id]["engine"], 245)
+                return (chunk_no * 100 - round_no * penalty, local_seq)
             if policy.startswith("tail_"):
                 penalty = int(policy.split("_")[2])
                 return (chunk_no * 100 - round_no * penalty, local_seq)
@@ -254,7 +263,7 @@ class KernelBuilder:
                     candidates = ready[engine]
                     tail_engines = (
                         {"valu", "alu", "flow"}
-                        if policy.startswith("tail_compute_")
+                        if policy.startswith(("tail_compute_", "tail_hetero_"))
                         else set(engine_order)
                     )
                     if (
@@ -311,7 +320,11 @@ class KernelBuilder:
             "cohort_1280",
         ) + tuple(f"cohort_{penalty}" for penalty in range(200, 461, 10)) + tuple(
             f"cohort_{penalty}" for penalty in range(221, 281)
-        ) + ("tail_laggard_240_1038", "tail_compute_245_960")
+        ) + (
+            "tail_laggard_240_1038",
+            "tail_compute_245_960",
+            "tail_hetero_360_240_240_220_900",
+        )
         self.schedule_stats = {}
         best = None
         for policy in dict.fromkeys(policies):
