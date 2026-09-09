@@ -918,3 +918,26 @@ all six previously recorded extra shapes with seeds 123, 456, 789. Extra-shape
 correctness is preserved, though `(8,12,256)` increases from 797 to 813 cycles:
 the engine split is tuned for the scored shape. Tests and simulator unchanged.
 Next: parity reuse, then a concrete depth-4 lookup storage/capacity experiment.
+
+## Iteration 15 — parity reuse and post-schedule node allocation
+
+Parent `5e53ff3`. Result **1,124 cycles**, scratch **1,371 words** (160 fewer).
+Reuse encoded root parity with reversed depth-1 selection operands, eliminating
+64 VALU masks. Input addresses and output-store addresses use index storage
+before its first / after its last index use. Virtual node buffers are assigned
+physical vectors after scheduling, by lookup lifetime, preserving all issue
+cycles. Twelve physical vectors replace 32 private vectors. Read-at-start,
+write-at-end semantics permit reuse when a previous last read coincides with
+the next first write. The simulator validates those same-cycle transitions.
+
+Slots: load 2,135; VALU 6,313; ALU 10,947; flow 544; store 32. First/last
+gather 74/1,103; drain 20. All official 9, built-in 3 tests pass; frozen seeds
+1000--1031 and six extra shapes with seeds 123,456,789 pass. Scratch across
+extra shapes remains within the 1,536-word limit.
+
+Rejected experiments: moving input address generation to flow saved 32 loads
+but regressed from 1,124 to 1,127 cycles. Fixed shared node pools added ordering
+edges: all-depth pooling measured 1,581--1,225 cycles for 4--16 banks; even
+shallow-only pooling measured 1,412--1,218. Replaced this approach with lifetime
+coloring of the already-selected schedule, which introduces no new waits.
+Next: use the newly freed storage for a depth-4 cache candidate.

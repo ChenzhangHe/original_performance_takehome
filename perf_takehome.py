@@ -512,14 +512,16 @@ class KernelBuilder:
         )
         idx = self.alloc_scratch("idx", batch_size)
         val = self.alloc_scratch("val", batch_size)
-        node_or_addr = self.alloc_scratch("node_or_addr", batch_size)
         tmp1 = self.alloc_scratch("tmp1", batch_size)
         tmp2 = self.alloc_scratch("tmp2", batch_size)
-        input_addrs = node_or_addr
+        # Virtual node addresses are colored after scheduling their lifetimes.
+        node_or_addr = self.scratch_ptr
+        input_addrs = idx  # The root index is implicit until the first hash.
 
         ops = setup_ops
         setup_count = len(setup_ops)
         shared_select_uses = []
+        node_pool_uses = []
         emit_context = {"chunk": -1, "round": -1, "local_seq": 0}
 
         def emit(engine, slot, *deps):
@@ -560,9 +562,7 @@ class KernelBuilder:
         def select(dest, cond, left, right, *deps):
             return emit("flow", ("vselect", dest, cond, left, right), *deps)
 
-        # These addresses die at the input vload, so node buffers can hold them.
-        # Keep constants independent: deriving them from chunk 0 would require
-        # anti-dependencies before that chunk reuses its node buffer.
+        # Index storage is free until the first root hash finishes.
         input_addr_ready = [
             emit("load", ("const", input_addrs + chunk_no * VLEN,
                           inp_values_p + chunk_no * VLEN))
@@ -574,7 +574,7 @@ class KernelBuilder:
             offset = chunk_no * VLEN
             chunk_idx = idx + offset
             chunk_val = val + offset
-            chunk_node = node_or_addr + offset
+            chunk_node = node_or_addr + chunk_no * 2 * VLEN
             chunk_tmp1 = tmp1 + offset
             chunk_tmp2 = tmp2 + offset
 
@@ -588,6 +588,7 @@ class KernelBuilder:
             for round_no in range(rounds):
                 emit_context["round"] = round_no
                 depth = round_no % (forest_height + 1)
+                lookup_start = len(ops)
                 if depth == 0:
                     root_round_value = (
                         root_value_copy if round_no == 0 else root_value_encoded
@@ -596,14 +597,11 @@ class KernelBuilder:
                         "^", chunk_val, chunk_val, root_round_value, val_ready
                     )
                 elif depth == 1 and LOOKUP_DEPTH >= 1:
-                    selected = emit(
-                        "valu",
-                        ("&", chunk_node, chunk_idx, one),
-                        idx_ready,
-                    )
+                    # Root update leaves encoded parity live in tmp1.
+                    # child_address = 9 - parity, hence invert the selection.
                     selected = select(
-                        chunk_node, chunk_node, depth1_right_vec, depth1_left_vec,
-                        selected,
+                        chunk_node, chunk_tmp1, depth1_left_vec, depth1_right_vec,
+                        idx_ready,
                     )
                     val_ready = emit(
                         "valu",
@@ -779,6 +777,8 @@ class KernelBuilder:
                         val_ready,
                         node_loads,
                     )
+                if depth != 0:
+                    node_pool_uses.append((chunk_node, lookup_start, len(ops)))
                 for stage, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     if stage == 3:
                         continue  # Already evaluated together with stage 2.
@@ -925,12 +925,12 @@ class KernelBuilder:
 
             store_addr = emit(
                 "flow",
-                ("add_imm", chunk_node, forest_values_scalar, inp_values_p + offset - forest_values_p),
+                ("add_imm", chunk_idx, forest_values_scalar, inp_values_p + offset - forest_values_p),
                 val_ready,
             )
             emit(
                 "store",
-                ("vstore", chunk_node, chunk_val),
+                ("vstore", chunk_idx, chunk_val),
                 val_ready,
                 store_addr,
             )
@@ -949,6 +949,55 @@ class KernelBuilder:
                     ops[writer]["deps"].append(previous_use)
                 previous_use = reader
         self.schedule(ops)
+        self.allocate_node_lifetimes(ops, node_pool_uses)
+
+    def allocate_node_lifetimes(self, ops, uses):
+        """Color node vectors after scheduling, preserving every issue cycle."""
+        times = {id(slot): cycle for cycle, bundle in enumerate(self.instrs)
+                 for slots in bundle.values() for slot in slots}
+        intervals = []
+        for base, start, end in uses:
+            for address in (base, base + VLEN):
+                addresses = set(range(address, address + VLEN))
+                touched = []
+                for op in ops[start:end]:
+                    reads, writes = self.instruction_accesses(op["engine"], op["slot"])
+                    if addresses & (reads | writes):
+                        touched.append(op)
+                if touched:
+                    intervals.append((min(times[id(o["slot"])] for o in touched),
+                                      max(times[id(o["slot"])] for o in touched),
+                                      address, start, end))
+        slots_end = []
+        replacements = {}
+        for first, last, address, start, end in sorted(intervals):
+            # Reads observe start-of-cycle state, writes commit at cycle end.
+            color = next((i for i, stop in enumerate(slots_end) if stop <= first),
+                         len(slots_end))
+            if color == len(slots_end):
+                slots_end.append(last)
+            else:
+                slots_end[color] = last
+            physical = self.scratch_ptr + color * VLEN
+            for op in ops[start:end]:
+                original = op["slot"]
+                slot = list(replacements.get(id(original), original))
+                engine = op["engine"]
+                positions = (range(1, len(slot)) if engine in ("alu", "valu")
+                             or (engine == "flow" and slot[0] == "vselect")
+                             else (1, 2) if engine in ("load", "store")
+                             and slot[0] != "const" else (1,))
+                for pos in positions:
+                    # Compare original addresses, never already-renamed ones.
+                    if address <= original[pos] < address + VLEN:
+                        slot[pos] = physical + original[pos] - address
+                replacements[id(original)] = tuple(slot)
+        self.alloc_scratch("node_pool", len(slots_end) * VLEN)
+        for bundle in self.instrs:
+            for engine, slots in bundle.items():
+                bundle[engine] = [replacements.get(id(slot), slot) for slot in slots]
+        for op in ops:
+            op["slot"] = replacements.get(id(op["slot"]), op["slot"])
 
 BASELINE = 147734
 
