@@ -231,7 +231,7 @@ class KernelBuilder:
             if policy.startswith("cohort_"):
                 penalty = int(policy.split("_")[1])
                 return (chunk_no * 100 - round_no * penalty, local_seq)
-            if policy.startswith("tail_hetero_"):
+            if policy.startswith(("tail_hetero_", "tail_multi_")):
                 fields = policy.split("_")
                 penalty = {
                     "load": int(fields[2]),
@@ -263,13 +263,26 @@ class KernelBuilder:
                     candidates = ready[engine]
                     tail_engines = (
                         {"valu", "alu", "flow"}
-                        if policy.startswith(("tail_compute_", "tail_hetero_"))
+                        if policy.startswith(
+                            ("tail_compute_", "tail_hetero_", "tail_multi_")
+                        )
                         else set(engine_order)
                     )
+                    if policy.startswith("tail_multi_"):
+                        fields = policy.split("_")
+                        tail_start = {
+                            "valu": int(fields[6]),
+                            "alu": int(fields[7]),
+                            "flow": int(fields[8]),
+                        }.get(engine, len(ops) + 1)
+                    elif policy.startswith("tail_"):
+                        tail_start = int(policy.rsplit("_", 1)[1])
+                    else:
+                        tail_start = len(ops) + 1
                     if (
                         policy.startswith("tail_")
                         and engine in tail_engines
-                        and len(bundles) >= int(policy.rsplit("_", 1)[1])
+                        and len(bundles) >= tail_start
                     ):
                         candidates.sort(
                             key=lambda op_id: (
@@ -324,6 +337,7 @@ class KernelBuilder:
             "tail_laggard_240_1038",
             "tail_compute_245_960",
             "tail_hetero_360_240_240_220_900",
+            "tail_multi_290_190_195_260_975_780_800",
         )
         self.schedule_stats = {}
         best = None

@@ -770,3 +770,60 @@ Final verification:
 - Frozen simulator/reference: 32 additional seeds pass on the scored shape.
 - Five extra `(height, rounds, batch)` shapes pass seeds 0, 1, and 123.
 - `git diff origin/main -- tests/ problem.py`: empty; `git diff --check`: pass.
+
+## Iteration 12 — September 8: independently timed engine tails
+
+Starting checkpoint: `4ddbe5f`, 1,156 cycles.
+
+### 12a. Fine-grained ALU-to-VALU index transfer — rejected
+
+The aggregate issue floors suggest that moving roughly five final index updates
+from scalar ALU to VALU should improve resource balance. Test the parity mask,
+the final subtraction, and both together, first by count and then at every
+individual chunk position. Each complete index update removes 16 ALU slots and
+adds two VALU slots.
+
+The transfer consistently ties or regresses: under the 1,156-cycle scheduler,
+the first 1–12 transferred chunks produce 1,157–1,161 cycles; under the later
+1,154-cycle scheduler they produce 1,155–1,159. Several isolated chunks tie,
+but none improves. The apparent aggregate ALU surplus is not available on the
+critical dependency chain; adding even one VALU operation can delay a gather or
+hash stage. Retain the scalar index update.
+
+### 12b. Joint heterogeneous-penalty search — retained
+
+The previous iteration tuned one engine penalty at a time. Search 3,000 joint
+combinations around that result while keeping the instruction DAG fixed. This
+finds `tail_hetero_290_200_190_230_890` at 1,154 cycles. A further 5,000-point
+local search finds a broad 1,154 plateau but no lower result.
+
+### 12c. Independent tail switch points — retained
+
+The heterogeneous policy still switched VALU, ALU, and flow into laggard mode
+on the same cycle. Add a `tail_multi` policy with one transition point per
+compute engine. A coarse grid reaches 1,153 cycles; two local joint searches
+reach the retained policy:
+
+```text
+load / VALU / ALU / flow penalties = 290 / 190 / 195 / 260
+VALU / ALU / flow tail switches    = 975 / 780 / 800
+```
+
+Final result: **1,152 cycles**, four fewer than `4ddbe5f`, with the operation
+mix and scratch allocation unchanged. Speedup over the original 147,734-cycle
+baseline is 128.24x.
+
+Insight: the issue engines finish their useful wavefront phases at very
+different times. ALU and flow should begin pulling lagging chunks forward near
+cycle 800, while VALU must preserve the normal pipelined order until roughly
+cycle 975 so it does not delay hashes and gathers. One global tail transition
+concealed this scheduling opportunity.
+
+Final verification:
+
+- Built-in tests: 3/3 pass, consistently 1,152 cycles.
+- Official `tests/submission_tests.py`: 9/9 pass, consistently 1,152 cycles.
+- Frozen simulator/reference: 32 additional seeds pass on the scored shape.
+- Extra `(height, rounds, batch)` shapes `(3,5,32)`, `(4,7,64)`,
+  `(6,11,128)`, `(8,12,256)`, `(10,8,256)`, and `(10,20,256)` pass.
+- Scratch remains 1,522 / 1,536 words; `git diff --check` passes.
