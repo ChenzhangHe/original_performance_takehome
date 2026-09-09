@@ -43,6 +43,7 @@ SETUP_CHUNK = 32
 HASH_ALU_CHUNKS = 0
 BIT_MASK_VALU_CHUNKS = 1
 DEPTH3_SHARED_SELECT = True
+PAIR_LOOKUP_DEPTH = 3
 
 
 class KernelBuilder:
@@ -427,6 +428,18 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", depth1_right_vec, depth1_right))
         self.add("valu", ("vbroadcast", depth1_left_vec, depth1_left))
 
+        def prepare_pairs(first, count, address):
+            # Replace each encoded value pair with E,D so F[A] = A*D+E.
+            # The setup-only zero word is dead after copying the raw root.
+            for offset in range(0, count, 2):
+                intercept, slope = first + offset, first + offset + 1
+                base = self.scratch_const(address + offset)
+                self.add("alu", ("-", slope, slope, intercept))
+                self.add("alu", ("*", zero, base, slope))
+                self.add("alu", ("-", intercept, intercept, zero))
+
+        if PAIR_LOOKUP_DEPTH >= 2:
+            prepare_pairs(top_nodes + 3, 4, forest_values_p + 3)
         depth2_values = [top_nodes + tree_idx for tree_idx in range(3, 7)]
         depth2_vectors = []
         for name, scalar in enumerate(depth2_values):
@@ -441,13 +454,15 @@ class KernelBuilder:
             self.add("load", ("vload", top_nodes, depth3_addr))
             for lane in range(VLEN):
                 self.add("alu", ("^", top_nodes + lane, top_nodes + lane, final_xor_const))
+            if PAIR_LOOKUP_DEPTH >= 3:
+                prepare_pairs(top_nodes, 8, forest_values_p + 7)
             depth3_vectors = []
             for i in range(4):
                 vector = self.alloc_scratch(f"depth3_lower_{i}", VLEN)
                 self.add("valu", ("vbroadcast", vector, top_nodes + i))
                 depth3_vectors.append(vector)
             a, b, c, d = [top_nodes + i for i in range(4, 8)]
-            if DEPTH3_SHARED_SELECT:
+            if DEPTH3_SHARED_SELECT or PAIR_LOOKUP_DEPTH >= 3:
                 upper_scalars = tuple(enumerate((a, b, c, d)))
             else:
                 for dest in (a, b, c):
@@ -596,6 +611,23 @@ class KernelBuilder:
                         val_ready,
                         selected,
                     )
+                elif depth == 2 and LOOKUP_DEPTH >= 2 and PAIR_LOOKUP_DEPTH >= 2:
+                    half = emit_scalar_rhs(
+                        "<", chunk_tmp1, chunk_idx, depth2_threshold, idx_ready
+                    )
+                    slope = select(
+                        chunk_node, chunk_tmp1, depth2_vectors[1], depth2_vectors[3], half
+                    )
+                    intercept = select(
+                        chunk_tmp2, chunk_tmp1, depth2_vectors[0], depth2_vectors[2], half
+                    )
+                    selected = emit(
+                        "valu", ("multiply_add", chunk_node, chunk_idx, chunk_node, chunk_tmp2),
+                        slope, intercept,
+                    )
+                    val_ready = emit(
+                        "valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected
+                    )
                 elif depth == 2 and LOOKUP_DEPTH >= 2:
                     if chunk_no < BIT_MASK_VALU_CHUNKS:
                         low_bit = emit(
@@ -626,6 +658,42 @@ class KernelBuilder:
                         ("^", chunk_val, chunk_val, chunk_node),
                         val_ready,
                         selected,
+                    )
+                elif depth == 3 and LOOKUP_DEPTH >= 3 and PAIR_LOOKUP_DEPTH >= 3:
+                    lower_half = emit_scalar_rhs(
+                        "<", chunk_tmp1, chunk_idx, depth3_thresholds[16], idx_ready
+                    )
+                    lower_slope = select(
+                        chunk_node, chunk_tmp1, depth3_vectors[1], depth3_vectors[3], lower_half
+                    )
+                    lower_intercept = select(
+                        chunk_tmp2, chunk_tmp1, depth3_vectors[0], depth3_vectors[2], lower_half
+                    )
+                    lower = emit(
+                        "valu", ("multiply_add", chunk_node, chunk_idx, chunk_node, chunk_tmp2),
+                        lower_slope, lower_intercept,
+                    )
+                    upper_half = emit_scalar_rhs(
+                        "<", chunk_tmp1, chunk_idx, depth3_thresholds[20], lower
+                    )
+                    upper_slope = select(
+                        chunk_tmp2, chunk_tmp1, depth3_vectors[5], depth3_vectors[7], upper_half
+                    )
+                    # Read the mask before overwriting it with the intercept.
+                    upper_intercept = select(
+                        chunk_tmp1, chunk_tmp1, depth3_vectors[4], depth3_vectors[6],
+                        upper_half, upper_slope,
+                    )
+                    upper = emit(
+                        "valu", ("multiply_add", chunk_tmp2, chunk_idx, chunk_tmp2, chunk_tmp1),
+                        upper_slope, upper_intercept,
+                    )
+                    half = emit_scalar_rhs(
+                        "<", chunk_tmp1, chunk_idx, depth3_thresholds[18], upper
+                    )
+                    selected = select(chunk_node, chunk_tmp1, chunk_node, chunk_tmp2, half, lower, upper)
+                    val_ready = emit(
+                        "valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected
                     )
                 elif depth == 3 and LOOKUP_DEPTH >= 3:
                     def mask(op, scalar, *deps):

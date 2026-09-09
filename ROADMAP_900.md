@@ -1,5 +1,9 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 14, **1,126 cycles**. Pair-linear
+depth-2/3 lookup and the readiness report are implemented. Detailed evidence
+is in `OPTIMIZATION_LOG.md`; historical budgets below identify their baselines.
+
 Revised 2026-09-09. Accepted kernel baseline: `d6f0289`, **1,152 cycles**,
 scored shape `(height=10, nodes=2047, batch=256, rounds=16)`.
 Iteration 1 is now implemented and fully checked at **1,142 cycles**, using

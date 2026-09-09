@@ -893,3 +893,28 @@ Verification:
 
 Next: implement the roadmap's readiness diagnostic and screen depth-4 lookup
 costs including setup, engine balance, and live scratch before changing lookup.
+
+## Iteration 14 — pair-linear shallow lookup without shared selection storage
+
+Parent: `634e669`. Result: **1,126 cycles**, down 16. Added
+`analyze_kernel.py` to recover actual issue times and dependency-ready waits
+from emitted operation identities, with engine/round counts and gather timing.
+Baseline loads were full for 1,066 cycles, confirming issue capacity pressure.
+
+Depth 2 selects the slope and intercept of an adjacent encoded-node pair and
+uses one MAC. Depth 3 computes a value for each quartet from its selected
+coefficients, then selects the correct half. This uses two MACs and five
+selects rather than one MAC and six selects; critically, it needs no shared
+vector or cross-chunk serialization. Setup reuses a dead scalar temporary.
+
+Slots: load 2,135 (+1), VALU 6,377 (+186), ALU 10,947 (-1,470), flow 544
+(-192), store 32. Scratch 1,531 (+1). The ALU delta includes 18 setup operations.
+First/last gather: 75 / 1,106; drain: 19 cycles. Winning policy remains
+`tail_hetero_360_240_240_220_900`. Index thresholds 23 and 28 both give 1,126;
+32 gives 1,127, so keep 23.
+
+Validation: official 9/9; built-in 3/3; frozen-reference seeds 1000--1031;
+all six previously recorded extra shapes with seeds 123, 456, 789. Extra-shape
+correctness is preserved, though `(8,12,256)` increases from 797 to 813 cycles:
+the engine split is tuned for the scored shape. Tests and simulator unchanged.
+Next: parity reuse, then a concrete depth-4 lookup storage/capacity experiment.
