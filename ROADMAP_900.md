@@ -1,8 +1,11 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
-Latest accepted implementation: iteration 16, **1,098 cycles**, with **1,507
-scratch words**. Selective round-4 depth-4 caching, pair-linear shallow lookup,
-parity reuse, node lifetime allocation, and readiness reporting are implemented.
+Latest accepted implementation: iteration 17, **1,090 cycles**, with **1,499
+scratch words**. Ten chunks use round-4 depth-4 caching; gathered nodes reuse
+hash temporaries. Pair-linear shallow lookup, parity reuse, node lifetime
+allocation, and readiness reporting are implemented. Work is paused after this
+iteration at the user's request. Current floors are VALU 1,062 and load 1,033;
+further work must address compute costs and readiness together.
 Detailed evidence
 is in `OPTIMIZATION_LOG.md`; historical budgets below identify their baselines.
 

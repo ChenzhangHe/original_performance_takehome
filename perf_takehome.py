@@ -44,7 +44,7 @@ HASH_ALU_CHUNKS = 0
 BIT_MASK_VALU_CHUNKS = 1
 DEPTH3_SHARED_SELECT = True
 PAIR_LOOKUP_DEPTH = 3
-DEPTH4_CACHE_CHUNKS = 8
+DEPTH4_CACHE_CHUNKS = 10
 DEPTH4_CACHE_ROUNDS = (4,)
 
 
@@ -608,6 +608,13 @@ class KernelBuilder:
             for round_no in range(rounds):
                 emit_context["round"] = round_no
                 depth = round_no % (forest_height + 1)
+                cached_lookup = (0 < depth <= LOOKUP_DEPTH) or (
+                    depth == 4 and cache_depth4 and chunk_no < DEPTH4_CACHE_CHUNKS
+                    and round_no in DEPTH4_CACHE_ROUNDS
+                )
+                # A gathered node dies at the input XOR, before hash tmp2 use.
+                chunk_node = (node_or_addr + chunk_no * 3 * VLEN
+                              if cached_lookup else chunk_tmp2)
                 lookup_start = len(ops)
                 if depth == 0:
                     root_round_value = (
@@ -836,7 +843,7 @@ class KernelBuilder:
                         val_ready,
                         node_loads,
                     )
-                if depth != 0:
+                if cached_lookup:
                     node_pool_uses.append((chunk_node, lookup_start, len(ops)))
                 for stage, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     if stage == 3:

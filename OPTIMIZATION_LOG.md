@@ -965,3 +965,43 @@ caching: it can create a 140-cycle drain despite saving 256 gather loads.
 Validation: official 9/9, built-in 3/3, frozen seeds 1000--1031; all six extra
 shapes with seeds 123,456,789 pass. Simulator/tests unchanged. Next: reduce
 node storage further and rebalance computation before expanding cache coverage.
+
+## Iteration 17 — alias gathered nodes with hash temporaries; expand early cache
+
+Parent `1d8bbfc`. Result **1,090 cycles**, down 8. Deep gathered values now use
+the chunk's hash `tmp2`: the input XOR consumes the node before the hash uses
+that temporary. This needs no cross-chunk dependency. Only cached lookups use
+the node lifetime allocator. The recovered storage permits increasing cached
+round-4 coverage from 8 to 10 chunks.
+
+Slots: load 2,065, VALU 6,369, ALU 11,467, flow 654, store 32. Scratch 1,499.
+Floors: load 1,033, VALU 1,062, ALU 956, flow 654. First/last gather 78/1,069;
+drain 20. VALU issues at full capacity for 1,023 cycles. Compared with this
+session's 1,142-cycle starting point, the accepted improvements total 52 cycles
+(4.55%). Original-baseline speedup is 135.54x.
+
+Coverage sweep with aliasing: 8/10/12/16/20/24/28/32 cached chunks gave
+1,098/1,090/1,090/1,090/1,103/1,107/1,101/1,111 cycles. Choose the smallest
+coverage attaining 1,090, avoiding extra lookup work and leaving more engine
+capacity for future changes.
+
+Rejected compute-rebalancing experiments:
+
+- Offloading the hash-stage-1 XOR arm to scalar ALU across 4/8/12 chunks did
+  not improve the cache-8 baseline; joint index thresholds were also checked.
+- Selecting the index bias through flow and then using one MAC removes index
+  subtraction work but lengthens its dependency path. At cache coverage 8,
+  4 flow-index chunks gave 1,096, while larger coverage gave 1,099--1,110.
+- Joint cache coverage 16/24/32, flow-index coverage 8/16/24, and hash offload
+  0/8 produced no improvement over 1,090 (best 1,102). Removed the unused
+  flow-index implementation rather than retaining a failed default path.
+
+Final verification: official 9/9 at 1,090; built-in 3/3; frozen seeds
+1000--1031; all six previous extra shapes with seeds 123,456,789. Tests and
+simulator unchanged; `git diff --check` passes. The readiness report runs on
+the final physically allocated instruction stream.
+
+Paused after this iteration at the user's request. Next investigation should
+target VALU work or dependency-aware changes to the hash/index transition;
+more uniform caching or scalar offload alone did not help. No unvalidated
+candidate is left enabled.
