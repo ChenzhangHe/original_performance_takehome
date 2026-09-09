@@ -827,3 +827,9 @@ Final verification:
 - Extra `(height, rounds, batch)` shapes `(3,5,32)`, `(4,7,64)`,
   `(6,11,128)`, `(8,12,256)`, `(10,8,256)`, and `(10,20,256)` pass.
 - Scratch remains 1,522 / 1,536 words; `git diff --check` passes.
+
+## Next-stage roadmap
+
+The resource budget, structural opportunities, and staged plan for moving from
+1,152 cycles toward approximately 900 are documented in
+[`ROADMAP_900.md`](ROADMAP_900.md).
