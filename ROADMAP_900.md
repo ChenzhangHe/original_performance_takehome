@@ -1,223 +1,206 @@
-# Roadmap: 1,152 cycles toward approximately 900
+# Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
-This document is the design baseline for optimization work after commit
-`d6f0289`. The current kernel is correct at **1,152 cycles**. The numbers below
-separate measured facts from estimates; none of the projected cycle counts are
-claims of achieved performance.
+Revised 2026-09-09. Accepted kernel baseline: `d6f0289`, **1,152 cycles**,
+scored shape `(height=10, nodes=2047, batch=256, rounds=16)`.
+Iteration 1 is now implemented and fully checked at **1,142 cycles**, using
+index threshold 23. Current slots: load 2,134, VALU 6,191, ALU 12,417,
+flow 736, store 32; scratch 1,530. Historical baseline tables below remain
+unchanged for comparison. See iteration 13 in `OPTIMIZATION_LOG.md`.
 
-## Why scheduling alone is no longer enough
+Documentation commit `684dcbd` did not change the kernel. Approximately 900
+is an exploratory target; the current plan does not yet prove it attainable.
 
-The measured instruction-slot mix at 1,152 cycles is:
+## Evidence and corrections
 
-| Engine | Slots | Capacity/cycle | Static floor | Slots available at 900 | Required reduction |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| load | 2,133 | 2 | 1,067 | 1,800 | 333 (15.6%) |
-| VALU | 6,594 | 6 | 1,099 | 5,400 | 1,194 (18.1%) |
-| ALU | 13,281 | 12 | 1,107 | 10,800 | 2,481 (18.7%) |
-| flow | 736 | 1 | 736 | 900 | none; 164 slots of headroom |
-| store | 32 | 2 | 16 | 1,800 | none |
+| Engine | Baseline slots | Capacity/cycle | Static floor | Capacity at 900 |
+| --- | ---: | ---: | ---: | ---: |
+| load | 2,133 | 2 | 1,067 | 1,800 |
+| VALU | 6,594 | 6 | 1,099 | 5,400 |
+| ALU | 13,281 | 12 | 1,107 | 10,800 |
+| flow | 736 | 1 | 736 | 900 |
+| store | 32 | 2 | 16 | 1,800 |
 
-The maximum static resource floor is already 1,107 cycles, only 45 cycles
-below the observed result. Better scheduling can close some of that gap, but it
-cannot reach 900. Reaching that neighborhood requires simultaneous reductions
-in load, VALU, and ALU work, followed by another scheduling pass.
+Scratch is 1,522 / 1,536 words. The explicit DAG's unit-latency longest path
+is 334 operations, excluding resource contention.
 
-This is the central insight from the current measurements: optimize the
-program being scheduled, not just the scheduler.
+The first gather issues at cycle 81 and the last at 1,138. Keeping that first
+issue time, 2,048 gathers require a completion boundary of at least
+`81 + 2048/2 = 1105`. This is conditional on observed timing, not a universal
+lower bound. Startup and post-gather work matter alongside aggregate capacity.
 
-## Principles for the next phase
+Corrections to the original roadmap:
 
-The useful ideas from the [Jalapeno write-up](https://zartbot.github.io/blog/arch/jalapeno/en.html)
-are broader than any individual trick:
+- Load reduction must begin before targeting sub-1,000 execution: the unchanged
+  load count alone requires 1,067 cycles.
+- Hash fusion saves 512 body VALU slots, but the diagnostic adds one setup
+  load, one broadcast, and eight scratch words.
+- Replacing 42 group-round gathers is only a necessary capacity calculation
+  under unchanged setup costs; startup, drain, and added computation remain.
+- Scratch sharing and scheduling have no guaranteed cycle savings. Measure
+  their effects for a concrete candidate.
 
-- A pipeline may be stalled even when no engine appears saturated, because a
-  long dependency chain is gating the next wave of work.
-- End-to-end critical-path latency matters in addition to aggregate throughput.
-- Algebraic rewrites, locality, prefetching, and exposed instruction-level
-  parallelism should be considered together.
-- This workload is fixed enough that the kernel generator can behave like a
-  specialized compiler: choose representations and implementations per round,
-  then autotune the resulting schedule.
+## Diagnostics already performed
 
-The public article reports a result within 2% of the leading submission but
-does not publish its exact score or implementation. The public 1,076-cycle
-[reference repository](https://github.com/lianghongkey/original_performance_takehome)
-and its [discussion](https://github.com/anthropics/original_performance_takehome/issues/44)
-are useful evidence that structural improvements beyond scheduling are
-available. Treat them as sources of questions and invariants, not code to copy.
+These were in-memory transformations, not changes to the accepted kernel.
 
-## Highest-confidence opportunity: fuse hash stages 2 and 3
+| Candidate | Cycles | load | VALU | ALU | flow | Scratch |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Accepted baseline | 1,152 | 2,133 | 6,594 | 13,281 | 736 | 1,522 |
+| Hash fusion only | 1,158 | 2,134 | 6,083 | 13,281 | 736 | 1,530 |
+| Fusion + index threshold 16 | 1,142 | 2,134 | 6,275 | 11,745 | 736 | 1,530 |
 
-For the input `x` to hash stage 2:
+Both diagnostic configurations above passed reference comparisons for seeds
+123, 456, and 789 on the scored shape. Full acceptance testing is pending.
+Index thresholds 20, 23, 24, and 26 also generated 1,142-cycle schedules but
+were not individually executed in those seed checks. Threshold 23 has
+6,191 VALU and 12,417 ALU slots. Equal cycles across this sweep suggest another
+limiting constraint; they do not prove equivalence after future changes.
+
+The fusion of zero-based hash stages 2 and 3 is:
 
 ```text
-x2 = (x + C2) + (x << 5)
-   = 33*x + C2
-
+x2 = 33*x + C2
 x3 = (x2 + C3) XOR (x2 << 9)
    = (33*x + C2 + C3) XOR ((33 << 9)*x + (C2 << 9))
 ```
 
-All arithmetic is modulo `2^32`. Computing the two affine expressions and
-their XOR takes three VALU operations instead of four. With 32 chunks and 16
-rounds, this should remove exactly **512 VALU slots**. Before any other change,
-the VALU floor would fall from 1,099 to approximately 1,014 cycles.
+All arithmetic is modulo 2^32. Two independent MACs and an XOR replace four
+body operations. The old shift constant 9 is also another stage's multiplier;
+removing that shift does not remove the constant from the whole program.
 
-This should be the next isolated implementation. Verify the algebra against
-the reference for random vectors, then run all existing correctness checks and
-measure the new engine mix before changing anything else.
+## Iteration 1: land fusion with resource rebalancing
 
-## Pair-linear lookup for cached depths 2 and 3
+Status: complete. Threshold 23 balances the compute floors at 1,032 VALU
+cycles and 1,035 ALU cycles. The next action is iteration 2's readiness report
+and depth-4 cost screening.
 
-For adjacent table entries `F[k]` and `F[k+1]`, define:
+Implement the diagnostic cleanly, reproduce 1,142 cycles, and select the
+index-engine split using execution time and resource headroom. Complete the
+acceptance checks below. Do not accept the fusion-only 1,158-cycle version
+as a performance improvement.
+
+Deliverable: a verified improvement and exact setup/body/scratch deltas.
+Resolve any discrepancy with the diagnostic before adding another change.
+
+## Iteration 2: measure readiness and screen depth-4 designs early
+
+Add a diagnostic report outside the timed kernel, with per-round engine counts,
+first/last issue, ready-but-not-issued work, and dependency waits. Separate
+first-gather startup, the gather interval, and post-gather drain. Derive
+resource bounds over release/deadline intervals where practical; distinguish
+proven bounds from observed timing.
+
+Build complete cost tables for gather, coefficient selection plus MAC,
+arithmetic lookup, and mixtures by round/chunk. Count setup, conversions,
+masks, live scratch, and dependency depth.
+
+A plain 16-node coefficient lookup selects two coefficients from eight pairs:
+14 binary vector selects per lookup. Replacing 42 gathers this way adds
+588 flow slots, exceeding the roughly 292 slots available after the estimated
+shallow-lookup savings. Reject that plain implementation for the 900 budget;
+screen other arithmetic/selection mixes.
+
+Deliverable: a feasible resource tradeoff or a quantified rejection, before
+investing in a large scratch allocator.
+
+## Iteration 3: reduce shallow lookup costs
+
+Test depth-2 and depth-3 pair-linear lookup separately:
 
 ```text
 D = F[k+1] - F[k]
 E = F[k] - address(k)*D
-F[A] = A*D + E       for A in this pair
+F[A] = A*D + E, for A in this pair
 ```
 
-The identity holds modulo `2^32`. It changes a lookup into selection of a
-coefficient pair followed by one MAC. Applied to the current depth-2/depth-3
-path, the initial estimate is:
+Initial combined body estimates relative to current shallow lookup:
+-1,488 ALU, -128 flow, +122 VALU slots. Coefficient setup is additional and
+must be measured. Test depth-1 parity reuse separately: potentially 64 fewer
+vector masks, contingent on correct encoded-parity polarity and lifetime.
 
-- about 1,488 fewer ALU slots;
-- about 128 fewer flow slots;
-- about 122 additional VALU slots.
+Rebalance engines after each change. Do not blindly retain earlier index
+migration decisions when the available ALU budget changes. Evaluate shallow
+lookup with the screened depth-4 design if its main value is freeing flow.
 
-The estimate must be confirmed from emitted instructions. It is attractive
-because hash fusion creates VALU headroom while ALU is currently the largest
-static floor. Reuse the previous round's parity at depth 1 as a separate small
-experiment; the current temporary remains live long enough to potentially
-remove 64 VALU mask operations.
+Fusion-only counts plus these body estimates yield about 6,205 VALU,
+11,793 ALU, and 608 flow slots before new setup: floors of 1,035, 983, and
+608 cycles. Load still requires 1,067. Approximately 805 VALU slots remain
+above the 900-cycle capacity before adding depth-4 work. This gap is unresolved.
 
-## Scratch-memory and lifetime redesign
+Deliverable: measured benefit or a demonstrated enabling tradeoff for the
+next combined candidate; keep speculative variants separate from the baseline.
 
-The current kernel uses 1,522 of 1,536 scratch words. `idx` and `val` need to
-remain live for the full batch, but node values and hash temporaries are much
-shorter-lived. Build an explicit live-interval table and allocate scratch as a
-register allocator would:
+## Iteration 4: reduce gathers with targeted scratch reuse
 
-- share node and temporary pools between wave-separated chunks;
-- reuse input-address storage as node storage after its last use;
-- reclaim dead cached/setup vectors in later rounds;
-- reserve a small tail pool instead of permanent private temporaries for every
-  group.
+Implement the best screened design on a subset of depth-4 group-rounds, then
+vary coverage and engine mix. Depth 4 occurs in rounds 4 and 15; optimize
+these independently because their downstream work differs.
 
-The goal is to free hundreds of words for depth-4 lookup structures. Because
-the current DAG mostly models explicit data dependencies, alias reuse must add
-the corresponding WAR and WAW ordering edges; accidental aliasing can otherwise
-produce a schedule that looks fast but is incorrect.
+Fusion emits 2,134 loads. Capacities at 1,000 and 900 require removing at least
+134 and 334 loads: at least 17 and 42 eight-load gathers with unchanged setup.
+Replacing all 64 depth-4 gathers removes 512 loads, leaving 1,622 before new
+setup. This is a search range, not proof that the compute budget fits.
 
-## The load target and depth-4 lookup
+Allocate scratch for the chosen design's actual live intervals. Start with
+dead setup/cache vectors and local temporary reuse. Add explicit WAR/WAW
+ordering and measure cross-chunk serialization. Preserve enough concurrently
+active chunks to hide latency.
 
-The kernel emits 2,048 deep-gather loads plus 85 setup/input loads. A 900-cycle
-schedule can issue at most 1,800 load slots, so at least 333 slots must
-disappear. Each group-round gather costs eight loads; without setup savings,
-that means replacing at least **42 group-round gathers**.
+Deliverable: reduced execution time including startup/drain, not just fewer
+loads or a smaller scratch footprint.
 
-Depth 4 occurs in two rounds, or 64 group-rounds. It is the natural next target,
-but replacing every gather with one uniform method is unlikely to balance all
-engines. Generate several exact implementations and choose between them per
-group and per round:
+## Iteration 5: shorten dependencies and close compute deficits
 
-- ordinary gather;
-- coefficient selection plus MAC;
-- flow-free delta/MAC chains;
-- coefficient broadcasts placed after earlier scratch regions die;
-- scalar ALU work only where a measured tail has spare ALU issue slots.
+Test preparing the next sibling pair or coefficients while the current hash
+runs. The current index determines the candidate pair; only its final choice
+needs the new parity. Verify preparation costs, readiness, and live storage.
+This is a hypothesis, not an established cheap lookup implementation.
 
-This is a constrained search problem. A candidate is useful only if its total
-resource floors and dependency-critical path improve, not merely its load
-count.
+Then evaluate individually:
 
-## Representation and index-update choices
+- per-round raw versus encoded hash state, including every conversion;
+- relative/path-bit indices during cached rounds, counting conversion back to
+  absolute addresses before gather;
+- further hash/constant folding and selected index work on spare engines;
+- advancing index arithmetic past its actual last reader instead of waiting
+  unnecessarily for the full hash, while preserving overwrite hazards.
 
-The current globally encoded hash state saves a final XOR in each hash but
-requires scalar XOR conversion for raw gathered nodes. Once the instruction
-mix changes, reevaluate the representation independently for cached-node and
-raw-gather rounds. A small dynamic program can choose state encodings and
-constant folds per round using measured engine costs.
+Deliverable: measured closure of the remaining compute budgets, or a precise
+remaining gap. Fitting loads alone does not establish 900-cycle feasibility.
 
-The index update has another trade: flow `vselect` can choose bias constants
-from the parity bit and replace some arithmetic. Flow has 164 slots of present
-headroom, potentially more after pair-linear lookup. Use that transformation
-selectively and preserve the absolute-address representation so gather-address
-arithmetic is not reintroduced elsewhere.
+## Iteration 6: tune scheduling around the new graph
 
-## Prefetching and scheduling
+Use critical slack, engine backlog, and readiness to target specific bubbles.
+Retune after substantial graph changes with bounded parameter searches.
+Speculative child loads are candidates only where load capacity and timing
+allow them.
 
-Speculatively loading both children may shorten a dependency chain but consumes
-additional load slots. Do not add it while load count is above the target
-floor. Reconsider it only after structural load reductions create real issue
-headroom.
+Stop scheduler searches that cease improving the observed bottleneck. There
+is no universal 10--20-cycle gap guarantee: aggregate and longest-path lower
+bounds can both be loose.
 
-After each meaningful DAG rewrite, retune scheduling using:
+## Record and acceptance protocol
 
-- earliest/latest start times and critical slack;
-- engine backlog and deadline-aware priorities;
-- per-round mixed implementation selection;
-- scratch/register-pressure constraints;
-- automated searches over structural choices and scheduler thresholds.
+Record the hypothesis, parent commit, exact configuration, setup/body slot
+deltas, cycles, scratch, startup/readiness/drain, correctness, and next limiting
+factor. Label diagnostics separately from accepted improvements. Preserve
+failed findings without accumulating failed code in the accepted kernel.
 
-The scheduler goal is to finish within roughly 10--20 cycles of the new static
-and dependency lower bounds. If it is already that close, return to operation
-count and critical-path reduction.
+Before accepting an implementation:
 
-## Iteration plan
+1. Pass built-in tests and all 9 official submission tests.
+2. Compare with the frozen reference across at least 32 additional scored-shape
+   seeds.
+3. Validate previously supported extra shapes; preserve compatibility by
+   default and explicitly justify any intended specialization.
+4. Confirm `tests/` and `problem.py` are unchanged and `git diff --check` passes.
+5. Confirm cycles for the final configuration; broaden or repeat testing only
+   when further changes or unresolved concerns justify it.
 
-### Phase A: 1,152 toward approximately 1,070
+Document and commit accepted performance improvements to the user's fork
+under the established commit/push workflow.
 
-1. Implement and measure hash-stage 2/3 fusion.
-2. Implement pair-linear depth-2/depth-3 lookup in isolation.
-3. Test depth-1 parity reuse in isolation.
-4. Recompute slot counts, resource floors, critical path, and schedule.
-
-### Phase B: approximately 1,070 toward 1,000
-
-1. Add explicit scratch live intervals and safe temporary sharing.
-2. Search round-specific raw/encoded state representations.
-3. Move selected work onto engines with measured headroom.
-
-### Phase C: approximately 1,000 toward 930--900
-
-1. Eliminate at least 42 group-round gathers, mainly through mixed depth-4
-   lookup strategies and any available setup-load reductions.
-2. Use reclaimed scratch for coefficients only during the intervals in which
-   they are needed.
-3. Jointly autotune implementation choices and schedule.
-
-### Phase D: close the remaining tail
-
-1. Add speculative prefetch only where the post-rewrite load trace has slack.
-2. Use critical-slack scheduling to drain lagging chunks.
-3. Sweep integer thresholds only after structural choices stabilize.
-
-These ranges are navigation aids, not promised intermediate scores.
-
-## Experiment and acceptance protocol
-
-Keep every structural experiment isolated and record:
-
-- exact load, VALU, ALU, flow, and store slot counts;
-- each engine's static floor and the overall maximum;
-- measured cycles and change from the previous accepted commit;
-- scratch high-water mark;
-- correctness results and any shapes on which specialization is intentional.
-
-Accept a candidate only when:
-
-1. it passes the built-in tests and all 9 official submission tests;
-2. it passes the frozen simulator/reference across at least 32 additional
-   scored-shape seeds;
-3. `tests/` and `problem.py` are unchanged;
-4. its benefit survives a clean repeated benchmark.
-
-Do not spend another iteration on scheduler-only changes unless either the
-structural floor has improved or the observed schedule remains more than about
-30 cycles above its current lower bound. Revert failed experiments rather than
-letting them accumulate in the kernel.
-
-The immediate next implementation is the isolated hash-stage 2/3 fusion. It
-has a proof, a precise expected slot saving, no additional scratch requirement,
-and directly attacks the current VALU floor.
+The [Jalapeno discussion](https://zartbot.github.io/blog/arch/jalapeno/en.html)
+motivates measuring dependency-driven waiting as well as throughput. For every
+experiment, ask both: how many instructions disappeared, and when did the
+next gather become ready?

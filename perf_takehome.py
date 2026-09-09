@@ -38,7 +38,7 @@ from problem import (
 
 
 LOOKUP_DEPTH = 3
-ALU_INDEX_CHUNKS = 32
+ALU_INDEX_CHUNKS = 23
 SETUP_CHUNK = 32
 HASH_ALU_CHUNKS = 0
 BIT_MASK_VALU_CHUNKS = 1
@@ -462,13 +462,25 @@ class KernelBuilder:
             depth3_shared = [top_nodes]
             depth3_thresholds = {n: self.scratch_const(n) for n in (16, 18, 20)}
 
+        # Stages 2/3 become two independent affine arms followed by XOR.
+        # All coefficients are reduced modulo the machine's 32-bit word size.
+        hash23_multiplier = 1 + (1 << HASH_STAGES[2][4])
+        hash23_shift = HASH_STAGES[3][4]
+        hash23_left_bias = (HASH_STAGES[2][1] + HASH_STAGES[3][1]) & 0xFFFFFFFF
+        hash23_right_multiplier = hash23_multiplier << hash23_shift
+        hash23_right_bias = (HASH_STAGES[2][1] << hash23_shift) & 0xFFFFFFFF
         hash_constants = {}
-        for op1, val1, op2, op3, val3 in HASH_STAGES:
+        for stage, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if stage in (2, 3):
+                continue
             if val3 != 16 and val1 not in hash_constants:
                 hash_constants[val1] = vector_const(val1, f"const_{val1:x}")
             fused = (op1, op2, op3) == ("+", "+", "<<")
             if not fused and val3 not in hash_constants:
                 hash_constants[val3] = vector_const(val3, f"const_{val3:x}")
+        for constant in (hash23_left_bias, hash23_right_multiplier, hash23_right_bias):
+            if constant not in hash_constants:
+                hash_constants[constant] = vector_const(constant, f"const_{constant:x}")
         depth2_threshold = self.scratch_const(12, "depth2_threshold")
         for op1, _val1, op2, op3, shift in HASH_STAGES:
             if (op1, op2, op3) == ("+", "+", "<<"):
@@ -699,8 +711,29 @@ class KernelBuilder:
                         val_ready,
                         node_loads,
                     )
-                for op1, val1, op2, op3, val3 in HASH_STAGES:
-                    if val3 == 16:
+                for stage, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    if stage == 3:
+                        continue  # Already evaluated together with stage 2.
+                    if stage == 2:
+                        left = emit(
+                            "valu",
+                            ("multiply_add", chunk_tmp1, chunk_val,
+                             hash_constants[hash23_multiplier],
+                             hash_constants[hash23_left_bias]),
+                            val_ready,
+                        )
+                        right = emit(
+                            "valu",
+                            ("multiply_add", chunk_tmp2, chunk_val,
+                             hash_constants[hash23_right_multiplier],
+                             hash_constants[hash23_right_bias]),
+                            val_ready,
+                        )
+                        val_ready = emit(
+                            "valu", ("^", chunk_val, chunk_tmp1, chunk_tmp2),
+                            left, right,
+                        )
+                    elif val3 == 16:
                         shifted = emit(
                             "valu",
                             (">>", chunk_tmp2, chunk_val, hash_constants[16]),

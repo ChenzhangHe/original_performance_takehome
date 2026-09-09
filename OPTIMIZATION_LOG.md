@@ -833,3 +833,63 @@ Final verification:
 The resource budget, structural opportunities, and staged plan for moving from
 1,152 cycles toward approximately 900 are documented in
 [`ROADMAP_900.md`](ROADMAP_900.md).
+
+### Roadmap review — 2026-09-09
+
+Replanned around resource tradeoffs and gather readiness. The accepted kernel
+remains at 1,152 cycles. In-memory diagnostics produced 1,158 for hash-stage
+2/3 fusion alone and 1,142 with some index arithmetic migrated to VALU. Both
+categories passed three scored-shape reference seeds; full acceptance testing
+and kernel implementation are pending. The revised roadmap brings load design
+forward, includes constant/scratch overheads, and replaces speculative cycle
+milestones with experiment deliverables and acceptance gates.
+
+## Iteration 13 — fuse hash stages 2/3 and rebalance index work
+
+Date: 2026-09-09. Parent commit: `684dcbd` (kernel baseline `d6f0289`).
+
+Implemented the two-affine-arm rewrite from the revised roadmap. The two MACs
+read the same stage input independently; their XOR produces the stage-3 result.
+Constants derive from `HASH_STAGES` with 32-bit modular biases. Stages 2 and 3
+no longer allocate their old constants unnecessarily, while shared constants
+such as multiplier 9 remain available.
+
+Fusion alone measured 1,158 cycles in the earlier diagnostic. Setting
+`ALU_INDEX_CHUNKS = 23` moves nine chunks' non-root index subtractions to VALU,
+using the capacity freed by fusion. The previously sampled thresholds 16, 20,
+23, 24, and 26 all scheduled at 1,142; 23 balances the compute resource floors
+at 1,032 VALU and 1,035 ALU cycles. This final configuration received the full
+verification below.
+
+| Metric | Previous | Accepted | Delta |
+| --- | ---: | ---: | ---: |
+| Cycles | 1,152 | 1,142 | -10 |
+| load slots | 2,133 | 2,134 | +1 |
+| VALU slots | 6,594 | 6,191 | -403 |
+| ALU slots | 13,281 | 12,417 | -864 |
+| flow slots | 736 | 736 | 0 |
+| store slots | 32 | 32 | 0 |
+| Scratch words | 1,522 | 1,530 | +8 |
+
+Accounting: fusion removes 512 body VALU slots; new constant setup adds one
+load and one broadcast; moving 108 vector-equivalent index subtractions to
+VALU adds 108 VALU slots and removes 864 ALU slots. Overall cycle reduction is
+0.87%, with 129.36x speedup over the original 147,734-cycle baseline.
+
+First gather moves from cycle 81 to 77, last gather from 1,138 to 1,127.
+Fourteen cycles remain after the last gather. The static load floor remains
+1,067, higher than both compute floors: gather readiness and issue capacity
+are the next investigation. Scratch has only six words left, making explicit
+lifetime planning necessary for additional vector constants.
+
+Verification:
+
+- Built-in tests: 3/3 pass, including trace and scored-shape execution.
+- Official submission tests: 9/9 pass at 1,142 cycles.
+- Frozen simulator/reference: 32 seeds (1000 through 1031) pass at 1,142.
+- Extra `(height, rounds, batch)` shapes `(3,5,32)`, `(4,7,64)`, `(6,11,128)`,
+  `(8,12,256)`, `(10,8,256)`, `(10,20,256)` each pass seeds 123, 456, 789.
+- `tests/` and `problem.py` are unchanged; `git diff --check` passes.
+
+Next: implement the roadmap's readiness diagnostic and screen depth-4 lookup
+costs including setup, engine balance, and live scratch before changing lookup.
