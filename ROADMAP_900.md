@@ -1,8 +1,9 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
-Latest accepted implementation: iteration 15, **1,124 cycles**, with **1,371
-scratch words**. Pair-linear depth-2/3 lookup, parity reuse, node lifetime
-allocation, and the readiness report are implemented. Detailed evidence
+Latest accepted implementation: iteration 16, **1,098 cycles**, with **1,507
+scratch words**. Selective round-4 depth-4 caching, pair-linear shallow lookup,
+parity reuse, node lifetime allocation, and readiness reporting are implemented.
+Detailed evidence
 is in `OPTIMIZATION_LOG.md`; historical budgets below identify their baselines.
 
 Revised 2026-09-09. Accepted kernel baseline: `d6f0289`, **1,152 cycles**,

@@ -941,3 +941,27 @@ edges: all-depth pooling measured 1,581--1,225 cycles for 4--16 banks; even
 shallow-only pooling measured 1,412--1,218. Replaced this approach with lifetime
 coloring of the already-selected schedule, which introduces no new waits.
 Next: use the newly freed storage for a depth-4 cache candidate.
+
+## Iteration 16 — selectively cache depth 4 in round 4
+
+Parent `419414a`. Result **1,098 cycles**, down 26. Cache the 16 encoded
+depth-4 nodes as adjacent-pair coefficients, then evaluate four quartets with
+four MACs and eleven vector selects per lookup. Apply this only to chunks
+0--7 in round 4 of the scored shape. Other shapes retain the generic path,
+avoiding unbudgeted cache live ranges. Node coloring now supports three
+virtual lookup vectors and still preserves issue cycles.
+
+Slots: load 2,081 (-54: 64 gather loads removed, 10 setup loads added), VALU
+6,361 (+48), ALU 11,371 (+424), flow 632 (+88), store 32. Scratch 1,507.
+Gather first/last: 78/1,077; drain 20. Static floors: load 1,041, VALU 1,061,
+ALU 948, flow 632. VALU now exceeds the load floor.
+
+Screening: round-4 coverage 4/8 chunks gave 1,114/1,098; larger coverage
+exceeded scratch for the chosen schedules. Round-15 coverage 4/8/24/32 gave
+1,162/1,202/1,239/1,237. Covering both rounds gave 1,146/1,170 at 4/8 chunks.
+Several other candidates exceeded scratch. This rejects uniform final-round
+caching: it can create a 140-cycle drain despite saving 256 gather loads.
+
+Validation: official 9/9, built-in 3/3, frozen seeds 1000--1031; all six extra
+shapes with seeds 123,456,789 pass. Simulator/tests unchanged. Next: reduce
+node storage further and rebalance computation before expanding cache coverage.

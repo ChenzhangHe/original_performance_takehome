@@ -44,6 +44,8 @@ HASH_ALU_CHUNKS = 0
 BIT_MASK_VALU_CHUNKS = 1
 DEPTH3_SHARED_SELECT = True
 PAIR_LOOKUP_DEPTH = 3
+DEPTH4_CACHE_CHUNKS = 8
+DEPTH4_CACHE_ROUNDS = (4,)
 
 
 class KernelBuilder:
@@ -385,6 +387,11 @@ class KernelBuilder:
         """
         assert batch_size % VLEN == 0
         chunk_count = batch_size // VLEN
+        # Cache coverage is tuned for the scored shape; retain the generic path
+        # elsewhere, where different overlap can require more live scratch.
+        cache_depth4 = (forest_height, batch_size, rounds) == (10, 256, 16) and DEPTH4_CACHE_CHUNKS > 0 and any(
+            r < rounds and r % (forest_height + 1) == 4 for r in DEPTH4_CACHE_ROUNDS
+        )
         forest_values_p = 7
         inp_values_p = forest_values_p + n_nodes + batch_size
 
@@ -476,6 +483,19 @@ class KernelBuilder:
                 depth3_vectors.append(vector)
             depth3_shared = [top_nodes]
             depth3_thresholds = {n: self.scratch_const(n) for n in (16, 18, 20)}
+
+        if cache_depth4:
+            depth4_vectors = []
+            depth4_thresholds = {n: self.scratch_const(n) for n in range(22, 38, 2)}
+            for address in (22, 30):
+                self.add("load", ("vload", top_nodes, depth4_thresholds[address]))
+                for lane in range(VLEN):
+                    self.add("alu", ("^", top_nodes + lane, top_nodes + lane, final_xor_const))
+                prepare_pairs(top_nodes, VLEN, address)
+                for lane in range(VLEN):
+                    vector = self.alloc_scratch(f"depth4_coef_{address}_{lane}", VLEN)
+                    self.add("valu", ("vbroadcast", vector, top_nodes + lane))
+                    depth4_vectors.append(vector)
 
         # Stages 2/3 become two independent affine arms followed by XOR.
         # All coefficients are reduced modulo the machine's 32-bit word size.
@@ -574,7 +594,7 @@ class KernelBuilder:
             offset = chunk_no * VLEN
             chunk_idx = idx + offset
             chunk_val = val + offset
-            chunk_node = node_or_addr + chunk_no * 2 * VLEN
+            chunk_node = node_or_addr + chunk_no * 3 * VLEN
             chunk_tmp1 = tmp1 + offset
             chunk_tmp2 = tmp2 + offset
 
@@ -748,6 +768,45 @@ class KernelBuilder:
                     selected = select(
                         chunk_node, chunk_tmp1, chunk_node, chunk_tmp2, half, upper, lower
                     )
+                    val_ready = emit(
+                        "valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected
+                    )
+                elif (depth == 4 and cache_depth4 and chunk_no < DEPTH4_CACHE_CHUNKS
+                      and round_no in DEPTH4_CACHE_ROUNDS):
+                    auxiliary = chunk_node + VLEN
+                    upper_result = chunk_node + 2 * VLEN
+
+                    def quartet(first, destination, *deps):
+                        half = emit_scalar_rhs(
+                            "<", chunk_tmp1, chunk_idx,
+                            depth4_thresholds[22 + first + 2], *deps,
+                        )
+                        slope = select(
+                            chunk_tmp2, chunk_tmp1, depth4_vectors[first + 1],
+                            depth4_vectors[first + 3], half,
+                        )
+                        intercept = select(
+                            chunk_tmp1, chunk_tmp1, depth4_vectors[first],
+                            depth4_vectors[first + 2], half, slope,
+                        )
+                        return emit(
+                            "valu", ("multiply_add", destination, chunk_idx, chunk_tmp2, chunk_tmp1),
+                            slope, intercept,
+                        )
+
+                    def octet(first, destination, *deps):
+                        lower = quartet(first, destination, *deps)
+                        upper = quartet(first + 4, auxiliary, lower)
+                        half = emit_scalar_rhs(
+                            "<", chunk_tmp1, chunk_idx,
+                            depth4_thresholds[22 + first + 4], upper,
+                        )
+                        return select(destination, chunk_tmp1, destination, auxiliary, half, lower, upper)
+
+                    lower = octet(0, chunk_node, idx_ready)
+                    upper = octet(8, upper_result, lower)
+                    half = emit_scalar_rhs("<", chunk_tmp1, chunk_idx, depth4_thresholds[30], upper)
+                    selected = select(chunk_node, chunk_tmp1, chunk_node, upper_result, half, lower, upper)
                     val_ready = emit(
                         "valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected
                     )
@@ -957,7 +1016,7 @@ class KernelBuilder:
                  for slots in bundle.values() for slot in slots}
         intervals = []
         for base, start, end in uses:
-            for address in (base, base + VLEN):
+            for address in (base, base + VLEN, base + 2 * VLEN):
                 addresses = set(range(address, address + VLEN))
                 touched = []
                 for op in ops[start:end]:
