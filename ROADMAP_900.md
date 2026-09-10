@@ -17,6 +17,115 @@ including all its setup loads and stores; evaluate cache changes against
 both compute and flow costs. Final-round preselection may shorten the tail
 but cannot by itself lower the aggregate compute bound to 900.
 
+## Active next experiments — operation reduction (2026-09-10)
+
+Implementation baseline: `d81dfe0`, **1,037 cycles**. The plan below supersedes
+the older experiment ordering later in this file. It is a documentation-only
+update: none of these candidates has been implemented or benchmarked yet.
+
+### Measured compute budget
+
+One vector-equivalent means one vector operation or eight scalar operations.
+This is a throughput accounting unit, not a claim that all operations can
+move between engines. In particular, MACs require VALU. Flow/load/store are
+budgeted separately.
+
+| Purpose | Vector-equivalent work |
+| --- | ---: |
+| Hash body (512 x 10) and final decode (32) | 5,152 |
+| Parity extraction and index updates | 832 |
+| Input XOR and gathered-node encoding | 744 |
+| Lookup MACs and masks | 488 |
+| Gather-address decoding | 232 |
+| Setup | 57.125 |
+| Total | 7,505.125 |
+
+The ideal 900-cycle compute capacity is 6,750, leaving a necessary reduction
+of **755.125** vector-equivalents. Moving instructions between engines does
+not reduce this total; count setup, copies, spills and reconstruction too.
+
+### A. Reuse path parity instead of extracting index bits — first priority
+
+Let p0, p1, ... be encoded-hash parity bits within one root-to-leaf traversal.
+The mathematical index representation follows S0=-2 and S(d+1)=2*S(d)+pd
+(mod 2^32); the implementation currently keeps only parity at the root.
+For the shallow levels, bit j of Sd equals p(d-1-j). Thus the predicates
+currently obtained with S&2, S&4 and S&8 are already available parity bits.
+The existing masks have values 0/2, 0/4 or 0/8; saved 0/1 parity is equivalent
+for vselect's zero/nonzero predicate. Preserve the coefficient-table order.
+
+All paths at depths 2, 3 and 4 (4, 8 and 16 paths respectively) were enumerated
+and this predicate identity passed. This proves the local identity, not a
+scheduled kernel's correctness or speed.
+
+Potential deletions under current cache coverage:
+
+- Depth 2: 64 group-rounds x one mask x eight lanes = 512 scalar operations.
+- Depth 3: 64 group-rounds x two masks x eight lanes = 1,024 operations.
+- Cached depth 4: 24 group-rounds x three masks x eight lanes = 576 operations.
+- Total: **2,112 scalar operations = 264 vector-equivalents**, before any
+  additional storage/copy costs. This is not a promised cycle reduction.
+
+Implementation order: depth 2 only, then depth 3, then cached depth 4. Give
+parity producers explicit logical versions and retain only required values
+until their last consumer. Extend lifetime allocation across these uses;
+do not reserve three permanent parity vectors for every group or introduce
+copies when renaming can preserve the producer instead. Current scratch has
+only 179 words free (1,357/1,536); measure peak live storage for each step.
+
+Gate: verify net operation deletions, correct dependencies and coefficient
+selection, scratch <=1,536, and full acceptance before adopting a faster
+candidate. A lower work count with worse cycles is diagnostic evidence,
+not an accepted performance improvement.
+
+### B. Lookup from path bits; materialize addresses only when needed
+
+For adjacent encoded node values F0 (lower address) and F1 (higher address),
+the latest encoded parity p selects the lower address when p=1. Therefore
+the selected value is F1+p*(F0-F1). Earlier parity bits select the pair.
+This may remove the shallow lookup's need for a complete S value and simplify
+coefficient setup. Construct the full address/index at the first consumer
+that actually needs it, including the transition from cached to gathered
+levels and the second root traversal.
+
+No net savings are claimed yet. Count delayed address reconstruction,
+retained parity storage and conversions; do not count A's mask deletions
+again. Retain this experiment only if it lowers total work or demonstrates
+a separately measured scheduling benefit without correctness regressions.
+
+### C. Bounded search for a shorter hash expression
+
+The body already uses ten vector instructions per group-round. Saving one
+more instruction across all 512 instances would remove 512 vector-equivalents.
+No such rewrite has been found. Search small expression windows first:
+stage 0 plus stage 1; fused stages 2/3 plus stage 4; and the boundary between
+the final hash stage and the next round's input XOR.
+
+Use the actual supported ISA and 32-bit modular arithmetic. Require an
+algebraic proof or solver-backed equivalence over all 32-bit inputs before
+acceptance, then run the full frozen-reference tests. Include constants,
+setup and boundary-round exceptions in the savings calculation. Bound each
+search and record exhausted windows rather than running open-ended tuning.
+
+A's gross 264 plus a hypothetical 512 from C would exceed the compute deficit
+only narrowly. Both net savings are unproven, and the 157-load/four-flow-slot
+deficits plus startup, dependencies and drain remain. This does not establish
+that 900 is attainable. After a structural gain, remeasure the budgets and
+only then retune cache coverage and scheduling. Any tree preprocessing must
+include all loads/stores and respect the input/output contract.
+
+### Reporting and acceptance for each experiment
+
+Record parent commit, hypothesis, body/setup operation deltas, net weighted
+work, per-engine floors, cycles, scratch, first/last gather and drain. Run
+official 9/9 and built-in 3/3 tests, frozen seeds 1000--1031 on the scored
+shape, and the six extra shapes x seeds 123/456/789 listed in the log. Keep
+tests and simulator unchanged. Commit/push validated speed improvements to
+the user's fork; document unsuccessful experiments without retaining broken
+or slower candidates in the accepted kernel.
+
+## Historical baselines and earlier roadmap
+
 Current accepted result: iteration 22, **1,040 cycles**, scratch **1,261**.
 Persistent I/O addresses remove 32 flow operations; retuned adaptive issue
 policies improve overlap. Full acceptance passes. Floors: load 995, VALU

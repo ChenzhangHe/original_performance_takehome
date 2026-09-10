@@ -1191,3 +1191,27 @@ ALU slots needs at least `ceil(7505.125/7.5)=1001` cycles. This optimistic
 bound ignores MAC restrictions and dependencies. At 900 the capacity is
 6750: about 755 vector-equivalents must disappear, alongside at least
 157 load slots and four flow slots. Scheduling alone cannot close this gap.
+
+## Planning update — path-bit reuse and operation-reduction gates (2026-09-10)
+
+Documentation only; implementation remains `d81dfe0` at **1,037 cycles**.
+Recounted compute by purpose: hash/final decode 5,152; parity/index 832;
+input XOR/node encoding 744; lookup MAC/masks 488; address decode 232;
+setup 57.125, totaling 7,505.125 vector-equivalents.
+
+Confirmed by exhaustive shallow-path enumeration: predicates S&2, S&4,
+S&8 equal earlier encoded parity bits under S'=2*S+p. Direct reuse could
+delete 2,112 scalar mask operations (264 vector-equivalents), before added
+copies/storage costs. No candidate kernel or cycle improvement is claimed.
+The 179 free scratch words make parity lifetime allocation a key constraint.
+
+The active plan at the top of `ROADMAP_900.md` now orders the next work:
+(A) retain/reuse parity, incrementally across depths 2, 3 and cached 4;
+(B) lookup directly from path bits and delay full address construction,
+counting all reconstruction costs without double-counting A;
+(C) bounded, fully equivalent hash-expression search. A one-instruction
+hash reduction would save 512 body operations, but no such identity is known.
+Each experiment must report net work and the remaining load/flow budget,
+then pass full acceptance before an implementation is committed as a gain.
+No kernel, simulator or test files changed in this planning update; runtime
+tests are not rerun for documentation-only changes.
