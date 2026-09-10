@@ -1075,3 +1075,21 @@ six supported extra shapes with seeds 123,456,789 pass. Extra-shape cycles are
 90,152,401,794,602,1626 in the previously documented order; the 20-round case
 increases by one cycle. No simulator/test changes. Next: round-specific
 compute offload, because prefix-wide hash offload previously delayed startup.
+
+## Iteration 19 — select depth-3 coefficients before one MAC
+
+Parent `06351d0`. Result **1,066 cycles**, down 10. Depth 3 now selects the
+final slope and intercept first, then computes one MAC: six selects replace
+five selects/two MACs. Across 64 chunk-rounds this trades +64 flow for -64
+VALU. Node lifetime allocation can reuse depth-4 coefficient vectors after
+their last scheduled use, without moving issue times. Scratch is 1,531.
+
+Slots: load 2,019; VALU 6,267; ALU 11,243; flow 848; store 32. Gather first/
+last 78/1,046; drain 19. VALU floor 1,045, full for 1,038 cycles.
+Official 9/9, built-in 3/3, 32 frozen scored seeds and six extra shapes x three
+seeds pass. Some extra shapes run more slowly; correctness remains intact.
+
+Rejected round-specific hash XOR offload: tested 8/16/24/32 chunks on rounds
+5--10, rounds 4--10 plus 15, and rounds 0,1,11,12. None improved 1,076 before
+the coefficient rewrite; results ranged from 1,079 to 1,176. Next: permute
+coefficient tables by absolute-address low bits to replace repeated comparisons.

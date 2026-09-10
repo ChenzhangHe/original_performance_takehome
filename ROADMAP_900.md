@@ -1,5 +1,9 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest: iteration 19 reaches **1,066 cycles**, scratch 1,531, by selecting
+depth-3 coefficients before one MAC. Full acceptance checks pass. Next is
+low-bit coefficient-table permutation to reduce mask-generation work.
+
 2026-09-10 accepted update: iteration 18 implements root-to-depth-2 address
 folding and 16 cached round-4 chunks at **1,076 cycles**, scratch **1,531**.
 Full official/built-in tests, 32 additional frozen-reference seeds, and all

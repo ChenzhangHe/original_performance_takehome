@@ -44,6 +44,7 @@ HASH_ALU_CHUNKS = 0
 BIT_MASK_VALU_CHUNKS = 1
 DEPTH3_SHARED_SELECT = True
 PAIR_LOOKUP_DEPTH = 3
+DEPTH3_COEFF_SELECT = True
 DEPTH4_CACHE_CHUNKS = 16
 DEPTH4_CACHE_ROUNDS = (4,)
 
@@ -692,6 +693,26 @@ class KernelBuilder:
                         val_ready,
                         selected,
                     )
+                elif depth == 3 and LOOKUP_DEPTH >= 3 and PAIR_LOOKUP_DEPTH >= 3 and DEPTH3_COEFF_SELECT:
+                    upper_d = chunk_node + VLEN
+                    final_mask = chunk_node + 2 * VLEN
+                    lower_half = emit_scalar_rhs(
+                        "<", chunk_tmp1, chunk_idx, depth3_thresholds[16], idx_ready
+                    )
+                    lower_slope = select(chunk_node, chunk_tmp1, depth3_vectors[1], depth3_vectors[3], lower_half)
+                    lower_intercept = select(chunk_tmp2, chunk_tmp1, depth3_vectors[0], depth3_vectors[2], lower_half)
+                    upper_half = emit_scalar_rhs(
+                        "<", chunk_tmp1, chunk_idx, depth3_thresholds[20], lower_slope, lower_intercept
+                    )
+                    upper_slope = select(upper_d, chunk_tmp1, depth3_vectors[5], depth3_vectors[7], upper_half)
+                    upper_intercept = select(chunk_tmp1, chunk_tmp1, depth3_vectors[4], depth3_vectors[6], upper_half, upper_slope)
+                    half = emit_scalar_rhs("<", final_mask, chunk_idx, depth3_thresholds[18], idx_ready)
+                    slope = select(chunk_node, final_mask, chunk_node, upper_d, half, lower_slope, upper_slope)
+                    intercept = select(chunk_tmp2, final_mask, chunk_tmp2, chunk_tmp1, half, lower_intercept, upper_intercept)
+                    selected = emit(
+                        "valu", ("multiply_add", chunk_node, chunk_idx, chunk_node, chunk_tmp2), slope, intercept
+                    )
+                    val_ready = emit("valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected)
                 elif depth == 3 and LOOKUP_DEPTH >= 3 and PAIR_LOOKUP_DEPTH >= 3:
                     lower_half = emit_scalar_rhs(
                         "<", chunk_tmp1, chunk_idx, depth3_thresholds[16], idx_ready
@@ -1017,9 +1038,9 @@ class KernelBuilder:
                     ops[writer]["deps"].append(previous_use)
                 previous_use = reader
         self.schedule(ops)
-        self.allocate_node_lifetimes(ops, node_pool_uses)
+        self.allocate_node_lifetimes(ops, node_pool_uses, depth4_vectors if cache_depth4 else ())
 
-    def allocate_node_lifetimes(self, ops, uses):
+    def allocate_node_lifetimes(self, ops, uses, reusable=()):
         """Color node vectors after scheduling, preserving every issue cycle."""
         times = {id(slot): cycle for cycle, bundle in enumerate(self.instrs)
                  for slots in bundle.values() for slot in slots}
@@ -1036,7 +1057,16 @@ class KernelBuilder:
                     intervals.append((min(times[id(o["slot"])] for o in touched),
                                       max(times[id(o["slot"])] for o in touched),
                                       address, start, end))
-        slots_end = []
+        # A cache coefficient's physical vector can host nodes after its last
+        # scheduled use. All original reads finish before any reused write.
+        last_use = {address: -1 for address in reusable}
+        for op in ops:
+            reads, writes = self.instruction_accesses(op["engine"], op["slot"])
+            for address in reusable:
+                if any(address <= a < address + VLEN for a in reads | writes):
+                    last_use[address] = max(last_use[address], times[id(op["slot"])])
+        physical_slots = list(reusable)
+        slots_end = [last_use[address] for address in reusable]
         replacements = {}
         for first, last, address, start, end in sorted(intervals):
             # Reads observe start-of-cycle state, writes commit at cycle end.
@@ -1044,9 +1074,10 @@ class KernelBuilder:
                          len(slots_end))
             if color == len(slots_end):
                 slots_end.append(last)
+                physical_slots.append(self.scratch_ptr + (color - len(reusable)) * VLEN)
             else:
                 slots_end[color] = last
-            physical = self.scratch_ptr + color * VLEN
+            physical = physical_slots[color]
             for op in ops[start:end]:
                 original = op["slot"]
                 slot = list(replacements.get(id(original), original))
@@ -1060,7 +1091,7 @@ class KernelBuilder:
                     if address <= original[pos] < address + VLEN:
                         slot[pos] = physical + original[pos] - address
                 replacements[id(original)] = tuple(slot)
-        self.alloc_scratch("node_pool", len(slots_end) * VLEN)
+        self.alloc_scratch("node_pool", (len(slots_end) - len(reusable)) * VLEN)
         for bundle in self.instrs:
             for engine, slots in bundle.items():
                 bundle[engine] = [replacements.get(id(slot), slot) for slot in slots]
