@@ -38,7 +38,6 @@ from problem import (
 
 
 LOOKUP_DEPTH = 3
-ALU_INDEX_CHUNKS = 23
 SETUP_CHUNK = 32
 HASH_ALU_CHUNKS = 0
 BIT_MASK_VALU_CHUNKS = 1
@@ -47,7 +46,7 @@ PAIR_LOOKUP_DEPTH = 3
 DEPTH3_COEFF_SELECT = True
 DEPTH4_BIT_SELECT = True
 NODE_VIRTUAL_VECTORS = 5
-DEPTH4_CACHE_CHUNKS = 20
+DEPTH4_CACHE_CHUNKS = 24
 DEPTH4_CACHE_ROUNDS = (4,)
 
 
@@ -414,6 +413,12 @@ class KernelBuilder:
         Build a SIMD kernel and list-schedule all vector chunks together.
         """
         assert batch_size % VLEN == 0
+        # Legacy lookup experiments below used positive addresses. Reject
+        # those switches until their formulas are ported to S=5-A as well.
+        assert (LOOKUP_DEPTH == PAIR_LOOKUP_DEPTH == 3
+                and DEPTH3_COEFF_SELECT and DEPTH4_BIT_SELECT), (
+            "Negative indices require the pair-coefficient low-bit lookup path"
+        )
         chunk_count = batch_size // VLEN
         # Cache coverage is tuned for the scored shape; retain the generic path
         # elsewhere, where different overlap can require more live scratch.
@@ -438,13 +443,14 @@ class KernelBuilder:
             self.add("valu", ("vbroadcast", vector, scalar))
             return vector
 
-        depth2_left_base = vector_const(11, "depth2_left_base")
-        depth2_right_base = vector_const(13, "depth2_right_base")
+        # For depths >= 2, idx holds S=5-A (mod 2**32), not an address.
+        # A'=2*A-5-p becomes S'=2*S+p: one multiply_add.
+        depth2_left_base = vector_const((-6) & 0xFFFFFFFF, "depth2_left_base")
+        depth2_right_base = vector_const((-8) & 0xFFFFFFFF, "depth2_right_base")
         one = vector_const(1, "one")
         two = vector_const(2, "two")
         forest_values_scalar = self.scratch_const(forest_values_p, "forest_values_scalar")
-        root_child_addr = self.scratch_const(forest_values_p + 2, "root_child_addr")
-        address_bias = vector_const((-5) & 0xFFFFFFFF, "address_bias")
+        address_five = self.scratch_const(5)
         final_xor_vec = vector_const(HASH_STAGES[-1][1], "final_xor")
         final_xor_const = self.const_map[HASH_STAGES[-1][1]]
         top_nodes = self.alloc_scratch("top_nodes", VLEN)
@@ -466,14 +472,16 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", depth1_left_vec, depth1_left))
 
         def prepare_pairs(first, count, address):
-            # Replace each encoded value pair with E,D so F[A] = A*D+E.
+            # For a pair starting at A0, D=F0-F1 and E=F0+(A0-5)*D.
+            # Thus F[A] = (5-A)*D+E, including wraparound arithmetic.
             # The setup-only zero word is dead after copying the raw root.
             for offset in range(0, count, 2):
                 intercept, slope = first + offset, first + offset + 1
                 base = self.scratch_const(address + offset)
-                self.add("alu", ("-", slope, slope, intercept))
-                self.add("alu", ("*", zero, base, slope))
-                self.add("alu", ("-", intercept, intercept, zero))
+                self.add("alu", ("-", slope, intercept, slope))
+                self.add("alu", ("-", zero, base, address_five))
+                self.add("alu", ("*", zero, zero, slope))
+                self.add("alu", ("+", intercept, intercept, zero))
 
         if PAIR_LOOKUP_DEPTH >= 2:
             prepare_pairs(top_nodes + 3, 4, forest_values_p + 3)
@@ -672,7 +680,7 @@ class KernelBuilder:
                         selected,
                     )
                     if depth < forest_height and round_no < rounds - 1:
-                        # Next address is (p0 ? 11 : 13) - p1. Prepare its
+                        # Next S is (p0 ? -6 : -8) + p1. Prepare its
                         # base while this round hashes, after the last p0 read.
                         idx_ready = select(
                             chunk_idx, chunk_idx, depth2_left_base,
@@ -680,7 +688,7 @@ class KernelBuilder:
                         )
                 elif depth == 2 and LOOKUP_DEPTH >= 2 and PAIR_LOOKUP_DEPTH >= 2:
                     half = emit_scalar_rhs(
-                        "<", chunk_tmp1, chunk_idx, depth2_threshold, idx_ready
+                        "&", chunk_tmp1, chunk_idx, self.const_map[2], idx_ready
                     )
                     slope = select(
                         chunk_node, chunk_tmp1, depth2_vectors[1], depth2_vectors[3], half
@@ -732,12 +740,12 @@ class KernelBuilder:
                     lower_half = emit_scalar_rhs(
                         "&", chunk_tmp1, chunk_idx, self.const_map[2], idx_ready
                     )
-                    # Absolute pair addresses 14,16,18,20 have low-bit codes
-                    # 3,0,1,2. Permuting the table avoids normalizing idx.
-                    lower_slope = select(chunk_node, chunk_tmp1, depth3_vectors[5], depth3_vectors[3], lower_half)
-                    lower_intercept = select(chunk_tmp2, chunk_tmp1, depth3_vectors[4], depth3_vectors[2], lower_half)
-                    upper_slope = select(upper_d, chunk_tmp1, depth3_vectors[1], depth3_vectors[7], lower_slope, lower_intercept)
-                    upper_intercept = select(chunk_tmp1, chunk_tmp1, depth3_vectors[0], depth3_vectors[6], upper_slope)
+                    # Pair starts A=14,16,18,20 map to S=-9,-11,-13,-15;
+                    # (S >> 1)&3 gives 3,2,1,0 for both members of each pair.
+                    lower_slope = select(chunk_node, chunk_tmp1, depth3_vectors[5], depth3_vectors[7], lower_half)
+                    lower_intercept = select(chunk_tmp2, chunk_tmp1, depth3_vectors[4], depth3_vectors[6], lower_half)
+                    upper_slope = select(upper_d, chunk_tmp1, depth3_vectors[1], depth3_vectors[3], lower_slope, lower_intercept)
+                    upper_intercept = select(chunk_tmp1, chunk_tmp1, depth3_vectors[0], depth3_vectors[2], upper_slope)
                     half = emit_scalar_rhs("&", final_mask, chunk_idx, depth3_bit4, upper_intercept)
                     slope = select(chunk_node, final_mask, upper_d, chunk_node, half, lower_slope, upper_slope)
                     intercept = select(chunk_tmp2, final_mask, chunk_tmp1, chunk_tmp2, half, lower_intercept, upper_intercept)
@@ -841,29 +849,30 @@ class KernelBuilder:
                     )
                 elif (depth == 4 and cache_depth4 and chunk_no < DEPTH4_CACHE_CHUNKS
                       and round_no in DEPTH4_CACHE_ROUNDS and DEPTH4_BIT_SELECT):
-                    intercept_result = chunk_node + VLEN
+                    upper_result = chunk_node + VLEN
+                    # Four interpolations trade three extra MACs for three
+                    # fewer selects. Share the three low-bit masks.
                     masks = [chunk_node + n * VLEN for n in (2, 3, 4)]
-                    mask_ready = [emit_scalar_rhs("&", masks[0], chunk_idx, self.const_map[2], idx_ready), None, None]
-                    order = sorted(range(8), key=lambda p: ((22 + 2*p) >> 1) & 7)
-
-                    def coefficient_tree(values, destination, *deps):
-                        left = select(chunk_tmp1, masks[0], values[1], values[0], mask_ready[0], *deps)
-                        right = select(chunk_tmp2, masks[0], values[3], values[2], mask_ready[0], *deps)
-                        if mask_ready[1] is None:
-                            mask_ready[1] = emit_scalar_rhs("&", masks[1], chunk_idx, depth3_bit4, left, right)
-                        lower = select(destination, masks[1], chunk_tmp2, chunk_tmp1, left, right, mask_ready[1])
-                        left = select(chunk_tmp1, masks[0], values[5], values[4], lower)
-                        right = select(chunk_tmp2, masks[0], values[7], values[6], lower)
-                        upper = select(chunk_tmp1, masks[1], chunk_tmp2, chunk_tmp1, left, right, mask_ready[1])
-                        if mask_ready[2] is None:
-                            mask_ready[2] = emit_scalar_rhs("&", masks[2], chunk_idx, depth4_bit8, upper)
-                        return select(destination, masks[2], chunk_tmp1, destination, lower, upper, mask_ready[2])
-
-                    slope = coefficient_tree([depth4_vectors[2*p+1] for p in order], chunk_node, idx_ready)
-                    intercept = coefficient_tree([depth4_vectors[2*p] for p in order], intercept_result, slope)
-                    selected = emit(
-                        "valu", ("multiply_add", chunk_node, chunk_idx, chunk_node, intercept_result), slope, intercept
-                    )
+                    auxiliary = masks[2]
+                    mask0 = emit_scalar_rhs("&", masks[0], chunk_idx, self.const_map[2], idx_ready)
+                    mask1 = None
+                    order = sorted(range(8), key=lambda p: ((5 - 22 - 2*p) >> 1) & 7)
+                    def quartet(pair, dest, *deps):
+                        p, q = order[pair:pair+2]
+                        slope = select(chunk_tmp1, masks[0], depth4_vectors[2*q+1], depth4_vectors[2*p+1], mask0, *deps)
+                        intercept = select(chunk_tmp2, masks[0], depth4_vectors[2*q], depth4_vectors[2*p], mask0, *deps)
+                        return emit("valu", ("multiply_add", dest, chunk_idx, chunk_tmp1, chunk_tmp2), slope, intercept)
+                    def octet(pair, dest, *deps):
+                        nonlocal mask1
+                        lower = quartet(pair, dest, *deps)
+                        upper = quartet(pair+2, auxiliary, lower)
+                        if mask1 is None:
+                            mask1 = emit_scalar_rhs("&", masks[1], chunk_idx, depth3_bit4, upper)
+                        return select(dest, masks[1], auxiliary, dest, mask1, lower, upper)
+                    lower = octet(0, chunk_node, idx_ready)
+                    upper = octet(4, upper_result, lower)
+                    mask2 = emit_scalar_rhs("&", masks[2], chunk_idx, depth4_bit8, upper)
+                    selected = select(chunk_node, masks[2], upper_result, chunk_node, lower, upper, mask2)
                     val_ready = emit("valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected)
                 elif (depth == 4 and cache_depth4 and chunk_no < DEPTH4_CACHE_CHUNKS
                       and round_no in DEPTH4_CACHE_ROUNDS):
@@ -905,13 +914,16 @@ class KernelBuilder:
                         "valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected
                     )
                 else:
+                    # Decode only gathered addresses; cached lookup uses S.
+                    address_ready = [
+                        emit("alu", ("-", chunk_node + lane, address_five, chunk_idx + lane), idx_ready)
+                        for lane in range(VLEN)
+                    ]
                     node_loads = [
                         emit(
                             "load",
-                            ("load_offset", chunk_node, chunk_idx, lane),
-                            idx_ready[lane]
-                            if isinstance(idx_ready, list)
-                            else idx_ready,
+                            ("load_offset", chunk_node, chunk_node, lane),
+                            address_ready[lane],
                         )
                         for lane in range(VLEN)
                     ]
@@ -1028,8 +1040,8 @@ class KernelBuilder:
                     idx_ready = None
                     continue
 
-                # 2*idx + (1 if val is even else 2)
-                # == 2*idx + 1 + (val & 1), without a flow-engine select.
+                # Encoded hash parity p is the inverse of raw hash parity.
+                # Keep p at the root, then use S'=2*S+p at deeper levels.
                 if depth == 0:
                     idx_ready = emit_scalar_vector("&", chunk_idx, chunk_val, one, val_ready)
                     continue
@@ -1037,38 +1049,9 @@ class KernelBuilder:
                     "&", chunk_tmp1, chunk_val, one, val_ready
                 )
                 if depth == 1:
-                    doubled = idx_ready
-                    index_base = chunk_idx
+                    idx_ready = emit_scalar_vector("+", chunk_idx, chunk_idx, chunk_tmp1, parity, idx_ready)
                 else:
-                    doubled = emit(
-                        "valu",
-                        ("multiply_add", chunk_idx, chunk_idx, two, address_bias),
-                        val_ready,
-                        idx_ready,
-                    )
-                    index_base = chunk_idx
-                if chunk_no < ALU_INDEX_CHUNKS:
-                    idx_ready = [
-                        emit(
-                            "alu",
-                            (
-                                "-",
-                                chunk_idx + lane,
-                                index_base + lane,
-                                chunk_tmp1 + lane,
-                            ),
-                            parity[lane],
-                            doubled,
-                        )
-                        for lane in range(VLEN)
-                    ]
-                else:
-                    idx_ready = emit(
-                        "valu",
-                        ("-", chunk_idx, index_base, chunk_tmp1),
-                        parity,
-                        doubled,
-                    )
+                    idx_ready = emit("valu", ("multiply_add", chunk_idx, chunk_idx, two, chunk_tmp1), parity, idx_ready)
 
             for start, end in zip(round_starts, round_starts[1:] + [len(ops)]):
                 node_pool_uses.append((chunk_tmp1, start, end, 1))

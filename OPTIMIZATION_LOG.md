@@ -1157,3 +1157,37 @@ constants give 1,052 versus the then-current 1,047. It passed three seeds
 on four shapes in an in-memory prototype. Investigate cheaper setup before
 discarding the representation. Pure scheduling cannot remove the current
 995-cycle load floor; reaching 900 requires fewer loads as well as compute.
+
+## Iteration 23 — negative indices plus shared-mask quartet interpolation
+
+Parent `dbc6964`. Result **1,037 cycles**, scratch **1,357 words**. Use
+`S=5-A (mod 2^32)` beyond the root parity representation. Since the encoded
+hash parity p is inverted, `A'=2*A-5-p` becomes `S'=2*S+p`, one MAC.
+For pair start A0, prepare `D=F0-F1, E=F0+(A0-5)*D`; then `F[A]=S*D+E`.
+Reuse existing positive A0 setup constants instead of loading negative ones.
+Gather addresses are decoded lane-wise only when needed, into the node temp.
+
+Depth-4 lookup shares three low-bit masks and evaluates four quartets before
+the final selection tree: 11 selects plus four MACs instead of 14 selects
+plus one MAC. This permits 24 cached chunks. Negative indices alone give
+1,041 at 20 chunks; positive-index quartets alone bottom at 1,051 in the
+16/20/24/28/32 sweep. Together, coverage 20/22/23/24/25/26/28/32 gives
+1,041/1,037/1,037/1,037/1,040/1,039/1,043/1,084 (20/28/32 measured before
+removing two unused setup constants). Retain 24, which reduces load pressure.
+Cache rotations and odd-stride permutations all regress: 1,046--1,076.
+
+Final slots: load 1,957; VALU 6,094; ALU 11,289; flow 904; store 32.
+First/last gather 79/1,015; drain 21. Selected policy:
+`adaptive_tail_hetero_360_220_220_140_750`, 96 adaptive vector offloads.
+Official 9/9, built-in 3/3, frozen seeds 1000--1031, and six extra shapes
+x three seeds pass. Extra-shape cycles: 92,154,394,770,604,1626.
+Tests and simulator unchanged. Remove obsolete ALU-index tuning option;
+reject legacy positive-address lookup switches instead of silently producing
+wrong results under the new representation.
+
+Key constraint: combined compute work is `6094 + 11289/8 = 7505.125`
+vector-equivalents. Even perfect allocation across 6 VALU plus 12 scalar
+ALU slots needs at least `ceil(7505.125/7.5)=1001` cycles. This optimistic
+bound ignores MAC restrictions and dependencies. At 900 the capacity is
+6750: about 755 vector-equivalents must disappear, alongside at least
+157 load slots and four flow slots. Scheduling alone cannot close this gap.

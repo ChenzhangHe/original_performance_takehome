@@ -40,17 +40,16 @@ def check(builder, seed, height=10, rounds=16, batch=256):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in (
-        "HASH_ALU_CHUNKS", "BIT_MASK_VALU_CHUNKS", "ALU_INDEX_CHUNKS",
+        "HASH_ALU_CHUNKS", "BIT_MASK_VALU_CHUNKS",
     ):
         parser.add_argument("--" + name.lower().replace("_", "-"), type=int, nargs="+", default=[getattr(kernel, name)])
     parser.add_argument("--seeds", type=int, nargs="+", default=[123])
     args = parser.parse_args()
-    for hash_chunks, bit_mask_chunks, index_chunks in product(
-        args.hash_alu_chunks, args.bit_mask_valu_chunks, args.alu_index_chunks,
+    for hash_chunks, bit_mask_chunks in product(
+        args.hash_alu_chunks, args.bit_mask_valu_chunks,
     ):
         kernel.HASH_ALU_CHUNKS = hash_chunks
         kernel.BIT_MASK_VALU_CHUNKS = bit_mask_chunks
-        kernel.ALU_INDEX_CHUNKS = index_chunks
         start = time.perf_counter()
         builder = kernel.KernelBuilder()
         builder.build_kernel(10, 2047, 256, 16)
@@ -61,7 +60,7 @@ def main():
         for bundle in builder.instrs:
             slots.update({engine: len(ops) for engine, ops in bundle.items()})
         print(json.dumps(dict(hash_chunks=hash_chunks,
-                              bit_mask_chunks=bit_mask_chunks, index_chunks=index_chunks,
+                              bit_mask_chunks=bit_mask_chunks,
                               cycles=cycles, scratch=builder.scratch_ptr, policy=builder.schedule_policy,
                               slots=dict(slots), checked_seeds=args.seeds, build_seconds=round(elapsed, 3))), flush=True)
 

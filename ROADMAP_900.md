@@ -1,5 +1,22 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Current accepted result: iteration 23, **1,037 cycles**, scratch **1,357**.
+Negative indices plus shared-mask quartet interpolation allow 24 cached
+round-4 chunks. Full acceptance passes. Floors: load 979, VALU 1,016,
+ALU 941, flow 904. Earlier "current" paragraphs below are historical.
+
+### Next gate: reduce the DAG, not just issue time
+
+The optimistic combined compute bound is now 1,001 cycles:
+`ceil((6094 + 11289/8)/(6 + 12/8))`. Reaching 900 needs at least about 755
+fewer vector-equivalent ALU/VALU operations, 157 fewer load slots, and four
+fewer flow slots, even before dependency/startup costs. These are necessary,
+not sufficient, reductions. Stop broad priority sweeps until a structural
+candidate improves this budget. Evaluate any tree pre-encoding/preprocessing
+including all its setup loads and stores; evaluate cache changes against
+both compute and flow costs. Final-round preselection may shorten the tail
+but cannot by itself lower the aggregate compute bound to 900.
+
 Current accepted result: iteration 22, **1,040 cycles**, scratch **1,261**.
 Persistent I/O addresses remove 32 flow operations; retuned adaptive issue
 policies improve overlap. Full acceptance passes. Floors: load 995, VALU
