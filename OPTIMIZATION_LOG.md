@@ -1093,3 +1093,27 @@ Rejected round-specific hash XOR offload: tested 8/16/24/32 chunks on rounds
 5--10, rounds 4--10 plus 15, and rounds 0,1,11,12. None improved 1,076 before
 the coefficient rewrite; results ranged from 1,079 to 1,176. Next: permute
 coefficient tables by absolute-address low bits to replace repeated comparisons.
+
+## Iteration 20 — low-bit coefficient tables and hash-temporary coloring
+
+Parent `02e563a`. Result **1,061 cycles**, scratch **1,269 words**. Permute
+depth-3 pair coefficients by `(address >> 1) & 3` and depth-4 coefficients by
+`(address >> 1) & 7`. The absolute address itself remains the MAC input, so
+no normalization or index conversion is introduced. Depth 3 uses two masks;
+depth 4 uses three shared masks, fourteen selects, and one MAC.
+
+Fixed per-chunk hash temporaries made these candidates exceed scratch. Extend
+post-schedule lifetime allocation to tmp1/tmp2 on each chunk-round, where
+every value is written before use and no value crosses round boundaries.
+Persistent storage is now only indices/values plus setup/cache data. This
+preserves issue times and allows the new lookup to fit without serialization.
+
+Slots: load 2,021 (+2), VALU 6,219 (-48), ALU 10,219 (-1,024), flow 896
+(+48), store 32. Gather first/last 78/1,046; drain 14. Official 9/9, built-in
+3/3, 32 frozen seeds and six extra shapes x three seeds pass. Compared to
+iteration 19 scratch falls by 262 words.
+
+Post-rewrite static offload sweep (hash chunks 0/4/8/12/16 and ALU index
+chunks 23/32) bottoms at 1,059, but larger offloads regress despite lower
+aggregate compute bounds. This motivates scheduling vector work on ALU only
+when a full eight-lane issue group can fit without delaying its completion.

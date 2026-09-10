@@ -1,5 +1,9 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest: iteration 20 reaches **1,061 cycles**, scratch **1,269**, with permuted
+low-bit coefficient lookup and lifetime allocation for hash temporaries.
+Acceptance checks pass; details and rejected experiments are in the log.
+
 Latest: iteration 19 reaches **1,066 cycles**, scratch 1,531, by selecting
 depth-3 coefficients before one MAC. Full acceptance checks pass. Next is
 low-bit coefficient-table permutation to reduce mask-generation work.
