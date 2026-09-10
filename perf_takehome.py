@@ -44,7 +44,7 @@ HASH_ALU_CHUNKS = 0
 BIT_MASK_VALU_CHUNKS = 1
 DEPTH3_SHARED_SELECT = True
 PAIR_LOOKUP_DEPTH = 3
-DEPTH4_CACHE_CHUNKS = 10
+DEPTH4_CACHE_CHUNKS = 16
 DEPTH4_CACHE_ROUNDS = (4,)
 
 
@@ -410,6 +410,8 @@ class KernelBuilder:
             self.add("valu", ("vbroadcast", vector, scalar))
             return vector
 
+        depth2_left_base = vector_const(11, "depth2_left_base")
+        depth2_right_base = vector_const(13, "depth2_right_base")
         one = vector_const(1, "one")
         two = vector_const(2, "two")
         forest_values_scalar = self.scratch_const(forest_values_p, "forest_values_scalar")
@@ -624,10 +626,9 @@ class KernelBuilder:
                         "^", chunk_val, chunk_val, root_round_value, val_ready
                     )
                 elif depth == 1 and LOOKUP_DEPTH >= 1:
-                    # Root update leaves encoded parity live in tmp1.
-                    # child_address = 9 - parity, hence invert the selection.
+                    # Keep root parity in idx instead of materializing 9-p0.
                     selected = select(
-                        chunk_node, chunk_tmp1, depth1_left_vec, depth1_right_vec,
+                        chunk_node, chunk_idx, depth1_left_vec, depth1_right_vec,
                         idx_ready,
                     )
                     val_ready = emit(
@@ -636,6 +637,13 @@ class KernelBuilder:
                         val_ready,
                         selected,
                     )
+                    if depth < forest_height and round_no < rounds - 1:
+                        # Next address is (p0 ? 11 : 13) - p1. Prepare its
+                        # base while this round hashes, after the last p0 read.
+                        idx_ready = select(
+                            chunk_idx, chunk_idx, depth2_left_base,
+                            depth2_right_base, selected,
+                        )
                 elif depth == 2 and LOOKUP_DEPTH >= 2 and PAIR_LOOKUP_DEPTH >= 2:
                     half = emit_scalar_rhs(
                         "<", chunk_tmp1, chunk_idx, depth2_threshold, idx_ready
@@ -943,12 +951,15 @@ class KernelBuilder:
 
                 # 2*idx + (1 if val is even else 2)
                 # == 2*idx + 1 + (val & 1), without a flow-engine select.
+                if depth == 0:
+                    idx_ready = emit_scalar_vector("&", chunk_idx, chunk_val, one, val_ready)
+                    continue
                 parity = emit_scalar_vector(
                     "&", chunk_tmp1, chunk_val, one, val_ready
                 )
-                if depth == 0:
-                    doubled = None
-                    index_base = root_child_addr
+                if depth == 1:
+                    doubled = idx_ready
+                    index_base = chunk_idx
                 else:
                     doubled = emit(
                         "valu",
@@ -957,16 +968,7 @@ class KernelBuilder:
                         idx_ready,
                     )
                     index_base = chunk_idx
-                if depth == 0:
-                    idx_ready = [
-                        emit(
-                            "alu",
-                            ("-", chunk_idx + lane, root_child_addr, chunk_tmp1 + lane),
-                            parity[lane],
-                        )
-                        for lane in range(VLEN)
-                    ]
-                elif chunk_no < ALU_INDEX_CHUNKS:
+                if chunk_no < ALU_INDEX_CHUNKS:
                     idx_ready = [
                         emit(
                             "alu",

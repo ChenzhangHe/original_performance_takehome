@@ -1,6 +1,12 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
-Latest accepted implementation: iteration 17, **1,090 cycles**, with **1,499
+2026-09-10 accepted update: iteration 18 implements root-to-depth-2 address
+folding and 16 cached round-4 chunks at **1,076 cycles**, scratch **1,531**.
+Full official/built-in tests, 32 additional frozen-reference seeds, and all
+supported extra shapes pass. See Analysis/Iteration 18 in the log for the
+proof and remaining 900-cycle deficits. Optimization work has resumed.
+
+Previous accepted implementation: iteration 17, **1,090 cycles**, with **1,499
 scratch words**. Ten chunks use round-4 depth-4 caching; gathered nodes reuse
 hash temporaries. Pair-linear shallow lookup, parity reuse, node lifetime
 allocation, and readiness reporting are implemented. Work is paused after this

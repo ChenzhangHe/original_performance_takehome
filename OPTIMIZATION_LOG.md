@@ -1005,3 +1005,73 @@ Paused after this iteration at the user's request. Next investigation should
 target VALU work or dependency-aware changes to the hash/index transition;
 more uniform caching or scalar offload alone did not help. No unvalidated
 candidate is left enabled.
+
+## Analysis 18 — fold the root-to-depth-2 address transition (2026-09-10)
+
+Accepted kernel remains `cea30d1`, 1,090 cycles. The following were in-memory
+diagnostics only; no kernel implementation or full acceptance is claimed.
+
+Let p0 and p1 be the encoded parity bits of the root and depth-1 hashes.
+The current absolute address calculation is:
+
+```text
+A1 = 9 - p0
+A2 = 2*A1 - 5 - p1 = 13 - 2*p0 - p1
+```
+
+Depth-1 node selection already needs only p0. Keep p0 in index storage instead
+of materializing A1. After selecting that node, use flow to choose the next
+base (11 for p0=1, otherwise 13), writing it back to index storage. This base
+can be selected before the depth-1 hash completes. After p1 is available,
+subtract it from the chosen base to obtain A2. Preserve the dependency from
+the depth-1 node selection to the overwrite of p0, and from base selection to
+the final subtraction. Other depths retain ordinary address representation.
+
+This removes 512 scalar root-subtraction instructions and 64 depth-1 MACs,
+adding 64 flow selects and two vector constants (two loads/two broadcasts).
+The extra constant storage is partly offset by changed node live ranges.
+
+| In-memory configuration | Cycles | Scratch |
+| --- | ---: | ---: |
+| Root folding, cache 10, no hash ALU offload | 1,087 | 1,507 |
+| Root folding, cache 16, no hash ALU offload | 1,076 | 1,531 |
+| Root folding, cache 24, no hash ALU offload | 1,097 | 1,531 |
+
+Also sampled hash ALU offload 4/8 for each of these cache coverages: none beat
+1,076. Best configuration passes frozen-reference seeds 123 and 1000--1031.
+Root folding at cache 10 additionally passes seeds 123,456,789 on shapes
+(10,16,256), (3,5,32), (4,7,64), and (10,20,256). These checks do not replace
+official/built-in tests and full extra-shape validation of the cache-16 version.
+
+Best candidate slots: load 2,019, VALU 6,331, ALU 11,243, flow 784, store 32.
+Static floors: load 1,010, VALU 1,056, ALU 937, flow 784. Only 20 cycles
+separate observed execution from the largest aggregate bound. A 900-cycle
+capacity budget still requires removing at least 219 loads, 931 VALU slots,
+and 443 ALU slots, with only 116 flow slots of headroom. These are necessary
+capacity conditions and exclude startup/drain constraints.
+
+Separate diagnostic: on the accepted kernel, allow the ordinary doubled-index
+MAC to start after lookup consumption rather than waiting for the entire hash.
+It is correct for three scored-shape seeds but gives 1,091 cycles. Do not apply
+it without evidence of a useful combination or a better schedule.
+
+Next implementation candidate: clean root-transition folding plus cache-16,
+remove obsolete root-address setup where possible, then complete all acceptance
+checks. Next structural questions: carry only the path information needed by
+cached rounds, or prepare future lookup coefficients while hashing, with their
+conversion and live-storage costs explicitly budgeted. Neither is implemented.
+
+## Iteration 18 — implement root transition folding at 1,076 cycles
+
+Parent `cea30d1`. Implemented Analysis 18's root parity representation and
+early selection of the depth-2 address base. Cache coverage is 16 chunks in
+round 4. The old root address constant remains in setup because its value 9
+also supplies a hash multiplier. Result **1,076 cycles**, down 14; scratch
+1,531. Slots: load 2,019, VALU 6,331, ALU 11,243, flow 784, store 32.
+Gather first/last 78/1,059; drain 16. VALU is full for 1,048 cycles.
+
+Full acceptance: official 9/9, built-in 3/3, frozen seeds 1000--1031, and all
+six supported extra shapes with seeds 123,456,789 pass. Extra-shape cycles are
+90,152,401,794,602,1626 in the previously documented order; the 20-round case
+increases by one cycle. No simulator/test changes. Next: round-specific
+compute offload, because prefix-wide hash offload previously delayed startup.
