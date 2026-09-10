@@ -1,5 +1,11 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Current accepted result: iteration 22, **1,040 cycles**, scratch **1,261**.
+Persistent I/O addresses remove 32 flow operations; retuned adaptive issue
+policies improve overlap. Full acceptance passes. Floors: load 995, VALU
+1,019, ALU 931, flow 920. Next experiments must reduce operation counts;
+the load floor alone rules out 900 for the present DAG.
+
 Latest: iteration 21 reaches **1,047 cycles**, scratch **1,197**, with adaptive
 whole-vector ALU issue and 20 cached round-4 chunks. Full acceptance passes.
 Current floors: load 995, VALU 1,018, ALU 935, flow 952. Flow also exceeds

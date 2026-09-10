@@ -360,6 +360,11 @@ class KernelBuilder:
             "tail_multi_290_190_195_260_975_780_800",
         )
         policies += tuple("adaptive_" + policy for policy in policies)
+        policies += (
+            "adaptive_tail_hetero_360_220_140_140_900",
+            "adaptive_tail_hetero_360_220_220_140_750",
+            "adaptive_tail_hetero_480_300_140_220_750",
+        )
         self.schedule_stats = {}
         best = None
         for policy in dict.fromkeys(policies):
@@ -559,12 +564,12 @@ class KernelBuilder:
         )
         idx = self.alloc_scratch("idx", batch_size)
         val = self.alloc_scratch("val", batch_size)
+        input_addrs = self.alloc_scratch("input_addrs", chunk_count)
         # Only idx/val persist across rounds. Node/hash scratch is virtual and
         # gets physical storage from its scheduled read/write lifetime.
         node_or_addr = self.scratch_ptr
         tmp1 = node_or_addr + chunk_count * NODE_VIRTUAL_VECTORS * VLEN
         tmp2 = tmp1 + batch_size
-        input_addrs = idx  # The root index is implicit until the first hash.
 
         ops = setup_ops
         setup_count = len(setup_ops)
@@ -610,9 +615,10 @@ class KernelBuilder:
         def select(dest, cond, left, right, *deps):
             return emit("flow", ("vselect", dest, cond, left, right), *deps)
 
-        # Index storage is free until the first root hash finishes.
+        # Keep these scalar addresses live through output stores, avoiding
+        # a separate flow add_imm for each chunk at the end of execution.
         input_addr_ready = [
-            emit("load", ("const", input_addrs + chunk_no * VLEN,
+            emit("load", ("const", input_addrs + chunk_no,
                           inp_values_p + chunk_no * VLEN))
             for chunk_no in range(chunk_count)
         ]
@@ -628,7 +634,7 @@ class KernelBuilder:
 
             val_ready = emit(
                 "load",
-                ("vload", chunk_val, input_addrs + offset),
+                ("vload", chunk_val, input_addrs + chunk_no),
                 input_addr_ready[chunk_no],
             )
             idx_ready = None  # At the root, the index is implicit, not read.
@@ -1067,14 +1073,10 @@ class KernelBuilder:
             for start, end in zip(round_starts, round_starts[1:] + [len(ops)]):
                 node_pool_uses.append((chunk_tmp1, start, end, 1))
                 node_pool_uses.append((chunk_tmp2, start, end, 1))
-            store_addr = emit(
-                "flow",
-                ("add_imm", chunk_idx, forest_values_scalar, inp_values_p + offset - forest_values_p),
-                val_ready,
-            )
+            store_addr = input_addr_ready[chunk_no]
             emit(
                 "store",
-                ("vstore", chunk_idx, chunk_val),
+                ("vstore", input_addrs + chunk_no, chunk_val),
                 val_ready,
                 store_addr,
             )

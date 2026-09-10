@@ -1137,3 +1137,23 @@ Full acceptance: official 9/9, built-in 3/3, frozen seeds 1000--1031, six
 extra shapes x three seeds; simulator and tests unchanged. Adaptive selection
 is data-independent and uses only DAG readiness and issue capacity. Next:
 evaluate index representation changes and then retune the changed schedule.
+
+## Iteration 22 — preserve I/O addresses and retune issue priorities
+
+Parent `34f4c99`. Result **1,040 cycles**, scratch **1,261 words**. Keep the
+32 input addresses alive until output stores instead of rebuilding them on
+the flow engine. Add three policies selected by a bounded scheduling sweep.
+The winning policy is `adaptive_tail_hetero_360_220_140_140_900`.
+
+Slots: load 1,989; VALU 6,112; ALU 11,171; flow 920; store 32. First/last
+gather 78/1,028; drain 11. Official 9/9, built-in 3/3, frozen seeds
+1000--1031 and six extra shapes x three seeds pass; tests/simulator unchanged.
+Extra-shape cycles: 92,153,396,769,600,1624. Cache coverage 18/20/22/24
+gives 1,048/1,040/1,044/1,058 with the new schedule; retain 20.
+
+Rejected preliminary negative-address representation `S=5-A`: transitions
+become `S'=2*S+p`, but decoding gather addresses and new coefficient setup
+constants give 1,052 versus the then-current 1,047. It passed three seeds
+on four shapes in an in-memory prototype. Investigate cheaper setup before
+discarding the representation. Pure scheduling cannot remove the current
+995-cycle load floor; reaching 900 requires fewer loads as well as compute.
