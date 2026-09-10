@@ -1117,3 +1117,23 @@ Post-rewrite static offload sweep (hash chunks 0/4/8/12/16 and ALU index
 chunks 23/32) bottoms at 1,059, but larger offloads regress despite lower
 aggregate compute bounds. This motivates scheduling vector work on ALU only
 when a full eight-lane issue group can fit without delaying its completion.
+
+## Iteration 21 — adaptive vector-to-ALU issue, with 20 cached chunks
+
+Parent `c964263`. Result **1,047 cycles**, down 14. After normal issue choices,
+adaptive policies can issue a ready binary vector instruction as eight ALU
+lanes if all eight fit in the same cycle. The logical instruction remains
+intact for dependency tracking and lifetime allocation; scalar lanes are
+materialized only afterward. The report now uses logical operation issue
+times and weights scalarized vectors by eight when reporting physical slots.
+
+The selected schedule offloads 116 vector operations. Cache coverage sweep
+16/18/20/22/24/26/28/32 gives 1,058/1,050/1,047/1,058/1,073/1,090/1,119/1,175.
+Choose 20. Slots: load 1,989, VALU 6,107, ALU 11,211, flow 952, store 32;
+scratch 1,197. First/last gather 78/1,033; drain 13. Resource floors are
+load 995, VALU 1,018, ALU 935, flow 952.
+
+Full acceptance: official 9/9, built-in 3/3, frozen seeds 1000--1031, six
+extra shapes x three seeds; simulator and tests unchanged. Adaptive selection
+is data-independent and uses only DAG readiness and issue capacity. Next:
+evaluate index representation changes and then retune the changed schedule.

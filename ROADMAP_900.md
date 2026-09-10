@@ -1,5 +1,10 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest: iteration 21 reaches **1,047 cycles**, scratch **1,197**, with adaptive
+whole-vector ALU issue and 20 cached round-4 chunks. Full acceptance passes.
+Current floors: load 995, VALU 1,018, ALU 935, flow 952. Flow also exceeds
+the 900-cycle budget now, so larger uniform cache coverage is not the answer.
+
 Latest: iteration 20 reaches **1,061 cycles**, scratch **1,269**, with permuted
 low-bit coefficient lookup and lifetime allocation for hash temporaries.
 Acceptance checks pass; details and rejected experiments are in the log.

@@ -5,7 +5,7 @@ import json
 from math import ceil
 
 from perf_takehome import KernelBuilder
-from problem import SLOT_LIMITS
+from problem import SLOT_LIMITS, VLEN
 
 
 class AnalyzedKernel(KernelBuilder):
@@ -16,13 +16,7 @@ class AnalyzedKernel(KernelBuilder):
 
 def analyze(builder):
     operations = builder.operations
-    identities = {id(op["slot"]): i for i, op in enumerate(operations)}
-    assert len(identities) == len(operations)
-    issued = {}
-    for cycle, bundle in enumerate(builder.instrs):
-        for slots in bundle.values():
-            for slot in slots:
-                issued[identities[id(slot)]] = cycle
+    issued = builder.issue_cycles
     assert len(issued) == len(operations)
     by_round = defaultdict(lambda: defaultdict(list))
     waits = defaultdict(list)
@@ -31,10 +25,11 @@ def analyze(builder):
     for i, op in enumerate(operations):
         ready = max((issued[d] + 1 for d in op["deps"]), default=0)
         assert issued[i] >= ready, (i, ready, issued[i])
-        engine = op["engine"]
-        counts[engine] += 1
-        waits[engine].append(issued[i] - ready)
-        by_round[op["round"]][engine].append(issued[i])
+        engine = "alu" if i in builder.offloaded_ops else op["engine"]
+        weight = VLEN if i in builder.offloaded_ops else 1
+        counts[engine] += weight
+        waits[engine].extend([issued[i] - ready] * weight)
+        by_round[op["round"]][engine].extend([issued[i]] * weight)
         if engine == "load" and op["slot"][0] == "load_offset":
             gathers.append(issued[i])
     engines = {}
@@ -53,6 +48,7 @@ def analyze(builder):
         "cycles": len(builder.instrs),
         "scratch": builder.scratch_ptr,
         "policy": builder.schedule_policy,
+        "offloaded_vector_ops": len(builder.offloaded_ops),
         "engines": engines,
         "gather": {
             "first": min(gathers), "last": max(gathers), "slots": len(gathers),

@@ -47,7 +47,7 @@ PAIR_LOOKUP_DEPTH = 3
 DEPTH3_COEFF_SELECT = True
 DEPTH4_BIT_SELECT = True
 NODE_VIRTUAL_VECTORS = 5
-DEPTH4_CACHE_CHUNKS = 16
+DEPTH4_CACHE_CHUNKS = 20
 DEPTH4_CACHE_ROUNDS = (4,)
 
 
@@ -252,6 +252,9 @@ class KernelBuilder:
             raise ValueError(policy)
 
         def make_schedule(policy):
+            adaptive = policy.startswith("adaptive_")
+            if adaptive:
+                policy = policy[len("adaptive_"):]
             priorities = [priority(policy, op_id) for op_id in range(len(ops))]
             remaining = dep_counts.copy()
             ready = defaultdict(list)
@@ -306,6 +309,17 @@ class KernelBuilder:
                         bundle[engine] = [ops[op_id]["slot"] for op_id in selected]
                         chosen.extend(selected)
 
+                # A binary vector op can issue as eight independent scalar
+                # lanes when the complete group fits this same cycle.
+                if adaptive and SLOT_LIMITS["alu"] - len(bundle.get("alu", ())) >= VLEN:
+                    offload = next((i for i in ready["valu"]
+                                    if ops[i]["slot"][0] not in ("vbroadcast", "multiply_add")), None)
+                    if offload is not None:
+                        ready["valu"].remove(offload)
+                        # Keep the logical vector intact until register allocation.
+                        bundle["alu_vector"] = [ops[offload]["slot"]]
+                        chosen.append(offload)
+
                 assert chosen, "Dependency cycle in scheduler"
                 bundles.append(bundle)
                 scheduled_count += len(chosen)
@@ -345,6 +359,7 @@ class KernelBuilder:
             "tail_hetero_360_240_240_220_900",
             "tail_multi_290_190_195_260_975_780_800",
         )
+        policies += tuple("adaptive_" + policy for policy in policies)
         self.schedule_stats = {}
         best = None
         for policy in dict.fromkeys(policies):
@@ -353,6 +368,11 @@ class KernelBuilder:
             if best is None or len(bundles) < len(best):
                 best = bundles
                 self.schedule_policy = policy
+        identities = {id(op["slot"]): i for i, op in enumerate(ops)}
+        self.issue_cycles = {identities[id(slot)]: cycle for cycle, bundle in enumerate(best)
+                             for slots in bundle.values() for slot in slots}
+        self.offloaded_ops = {identities[id(slot)] for bundle in best
+                              for slot in bundle.get("alu_vector", ())}
         self.instrs.extend(best)
 
     def alloc_scratch(self, name=None, length=1):
@@ -1074,6 +1094,11 @@ class KernelBuilder:
                 previous_use = reader
         self.schedule(ops)
         self.allocate_node_lifetimes(ops, node_pool_uses, depth4_vectors if cache_depth4 else ())
+        for bundle in self.instrs:
+            for op, dest, left, right in bundle.pop("alu_vector", ()):
+                bundle.setdefault("alu", []).extend(
+                    (op, dest + lane, left + lane, right + lane) for lane in range(VLEN)
+                )
 
     def allocate_node_lifetimes(self, ops, uses, reusable=()):
         """Color node vectors after scheduling, preserving every issue cycle."""
