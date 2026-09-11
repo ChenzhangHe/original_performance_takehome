@@ -1465,3 +1465,121 @@ The separate VLIW With Indices leader is **899**, not directly comparable
 to our no-final-index output. Record sources, timestamp, and limitations in
 `LEADERBOARD_NOTES.md`. No board submission or login was performed. The
 current DAG's floor is not a lower bound for all possible algorithms.
+
+## Iteration 30 — runtime node pre-encoding, including its full cost
+
+Parent `95ca48d`. Accepted result **994 cycles**, scratch **1,432**. The
+gain is only one elapsed cycle. The structural result is a net deletion of
+**83.75 vector-equivalent compute operations**, not a large speedup.
+
+For the scored shape, copy tree nodes 15..126 (depths 4--6, 112 words) into
+the first 112 words of the input-index array, XOR-encoding each vector at
+runtime with the hash's final constant. The kernel already does not output
+final indices. This workspace is not the forest or the input-value array;
+no runtime input value is known or precomputed by the Python builder.
+All computation and copying executes as ordinary simulator instructions.
+Other shapes keep the previous implementation. `NODE_PREENCODE_DEPTH = 0`
+turns the entire transformation off and reproduces 995 cycles.
+
+For an original node address A=7+n and S=5-A, its copied address is
+`(5 + n_nodes - 15) - S = 7 + n_nodes + (n - 15)`. Thus address rebasing
+changes only the subtraction constant, not the per-gather operation count.
+Each copied-level gather waits for every store in that level to commit,
+because the actual selected node is runtime-dependent. Two scratch vector
+buffers are reused only after their previous stores, and their storage can
+join the node pool after the copies' last scheduled use.
+
+### Measured body and setup budget
+
+- 37 depth-4 gathers (6 first traversal, 31 final traversal), 32 depth-5
+  gathers and 32 depth-6 gathers no longer execute per-lane node encoding:
+  remove **808 scalar XORs = 101 vector-equivalents**.
+- Add 14 vector loads, 14 vector XORs, 14 vector stores, three scalar
+  constant loads, and 26 scalar pointer updates. Net compute deletion:
+  `101 - 14 - 26/8 = 83.75`. Net loads **+17**, stores **+14**, flow unchanged.
+- Whole-program slots: load **1,923**, VALU **5,864**, ALU **10,313**, flow
+  **939**, store **46**. 346 binary vector operations offload to ALU. Weighted
+  compute **7,153.125**, versus the parent's 7,236.875.
+- Floors: load **962**, VALU **978**, ALU **860**, flow **939**; optimistic
+  combined compute **954**. First/last gather **61/983**, drain **10**,
+  gather slots **1,832**. The load count and startup offset explain why
+  removing substantial scalar work translates to only one elapsed cycle.
+
+Preprocessing alone ties 995 at depths 4--6. A metadata-only setup pass
+propagates each body's first consuming round backward through the DAG and
+uses that round, capped at 4, as setup priority. It does not delete or relax
+dependencies. This yields 994 with the same existing policy,
+`balanced_adaptive_tail_hetero_360_220_140_140_900`. The setup prefix boundary
+is adjusted after constant DCE; all removed constants precede the runtime
+copy sequence. DCE still removes 10 loads. No new scheduler policy is kept.
+
+### Rejected experiments in this session
+
+All following results are probes, not accepted alternate kernels. Initial
+direct-address, logical-hazard and preencoding-range probes used seeds
+123/456/789; later combination sweeps used seed 123 unless stated otherwise.
+
+| Experiment | Configurations | Cycles |
+| --- | --- | --- |
+| Direct positive addresses on the new baseline | first cache 26 / 25 / 27 | 997 / 999 / 1,001 |
+| Rebuild scratch hazards using logical lifetimes | cache 26 / 25 / 27 | 996 / 998 / 1,001 |
+| Runtime preencoding, old setup priorities | depths 4--5 / 4--6 / 4--7 / 5--7 / 6--7 | 997 / 995 / 998 / 999 / 1,000 |
+| Preencode 4--5, increase first cache | 27 / 28 | 1,007 / 1,015 |
+| Preencode 4--6, increase first cache | 27 / 28 | 1,004 / 1,013 |
+| Preencode 4--7, increase first cache | 27 / 28 / 29 | 1,002 / 1,013 / 1,024 |
+| Static hash-arm ALU lowering, preencode 4--5 | 4 / 8 / 12 groups | 998 / 996 / 996 |
+| Static hash-arm ALU lowering, preencode 4--6 | 4 / 8 / 12 groups | 999 / 999 / 996 |
+| Independent flow-generated copy addresses, first-use setup | depths 4--5, 2 / 4 buffers | 996 / 996 |
+| Same independent copy addresses | depths 4--6, 2 / 4 buffers | 1,006 / 1,007 |
+
+The direct-address probe lowers compute to 7,179.875 but still loses: extra
+constant loads and changed readiness matter. Logical-hazard reconstruction
+removes redundant explicit edges (104,012 -> 64,269 at cache 26), but improves
+neither operation count nor cycles. These are not proofs that every address
+representation or dependency scheduler is exhausted.
+
+Joint ALU/VALU assignment was also tried: reserve a ready binary vector for
+ALU BEFORE choosing VALU slots, with scalar queue limits 4/12/24. On the
+parent, always reserving gives 1,006/998/1,000; reserving only when VALU has
+more than six candidates gives 1,006/998/999. With preencoding 4--6 these
+become 1,004/997/1,001 and 1,004/997/1,001. It shifts more work to ALU but
+does not shorten the load-critical execution. Combining queue limit 12 with
+cache 27 gives 1,007 (always) / 1,003 (demand); cache 28 gives 1,013 in both.
+
+Depth-4 interpolation mixes trade MACs for extra flow operations. Full
+coefficient-first trees on the lowest 4/8/12 cached groups give
+1,001/1,011/1,023; the highest 4/8/12 give 1,004/1,015/1,026. Using two
+coefficient-first octets gives 998/1,007/1,014 (low groups) and
+1,002/1,008/1,016 (high groups). Changing only the lower octet gives
+995/998/1,005 and 998/1,002/1,002. All fail to beat 995; keep the quartet
+lookup, not any of these mixed forms.
+
+Setup first-use priorities alone on the parent give 999/995/995/996 for
+`(round lead, cap)=(0,4)/(1,4)/(2,4)/(1,2)`. With preprocessing these give
+994/998/998/994. Retain the simpler zero-lead/cap-4 rule only when
+preprocessing is enabled. This is a bounded causal test, not an expanded
+priority-coefficient search.
+
+### Acceptance and reproduction
+
+Official **9/9**, built-in **3/3**, frozen seeds **1000--1031**, six extra
+shapes x **123/456/789**, and alternative (PATH,DIRECT)=(0,0)/(2,2)/(3,3)
+x three seeds pass. Extra-shape cycles remain **72,150,350,751,590,1614**;
+alternate modes give **1,021/1,015/1,005**. Four full-32-bit boundary-pattern
+fixtures also pass, checking exact workspace encodings, final values, and
+unchanged forest/header/index-tail contents. The tuning helper now checks
+untouched memory outside the declared workspace on every candidate.
+
+Reproduce the accepted A/B with:
+
+```sh
+python3 tune_kernel.py --node-preencode-depth 0 6 --seeds 123 456 789
+python3 tests/submission_tests.py
+python3 analyze_kernel.py
+```
+
+The report exposes preencoded node count. Official tests and `problem.py`
+remain unchanged. Necessary 900-cycle deficits now are 403.125 compute
+equivalents, 123 loads, and 39 flow operations. The load deficit is WORSE
+than the parent despite the arithmetic reduction. No leaderboard upload or
+new leaderboard research was performed during this iteration.

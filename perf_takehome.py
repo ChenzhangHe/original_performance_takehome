@@ -54,6 +54,7 @@ DIRECT_PATH_DEPTH = 4
 ALU_VECTOR_BACKLOG = 12
 ALU_VECTOR_RESERVE_START = 60
 INPUT_ADDRESS_CHAIN_LENGTH = 2
+NODE_PREENCODE_DEPTH = 6  # Zero disables runtime preprocessing.
 
 
 class KernelBuilder:
@@ -441,6 +442,7 @@ class KernelBuilder:
         """
         assert batch_size % VLEN == 0
         assert INPUT_ADDRESS_CHAIN_LENGTH >= 1
+        assert NODE_PREENCODE_DEPTH in (0, 4, 5, 6, 7)
         assert PATH_REUSE_DEPTH in (0, 2, 3, 4)
         assert DIRECT_PATH_DEPTH in (0, 2, 3, 4) and DIRECT_PATH_DEPTH <= PATH_REUSE_DEPTH
         # Legacy lookup experiments below used positive addresses. Reject
@@ -462,6 +464,18 @@ class KernelBuilder:
                 # The final coefficient tree uses all retained path parities.
                 return DIRECT_PATH_DEPTH >= 4 and chunk_no < DEPTH4_FINAL_CACHE_CHUNKS
             return chunk_no < DEPTH4_CACHE_CHUNKS
+
+        # The scored contract requires final values, not final indices. Use
+        # part of the otherwise-unused index array as runtime workspace; the
+        # forest and input values are never overwritten by preprocessing.
+        preencode = (forest_height, batch_size, rounds) == (10, 256, 16) and NODE_PREENCODE_DEPTH > 0
+        encode_first = 4
+        encode_last = NODE_PREENCODE_DEPTH
+        encode_node_first = (1 << encode_first) - 1
+        encode_node_end = (1 << (encode_last + 1)) - 1
+        self.preencoded_node_count = encode_node_end - encode_node_first if preencode else 0
+        if preencode:
+            assert self.preencoded_node_count <= batch_size
 
         forest_values_p = 7
         inp_values_p = forest_values_p + n_nodes + batch_size
@@ -626,6 +640,10 @@ class KernelBuilder:
         setup_ops, setup_writers = self.pack_setup(
             extract=True, setup_chunk=SETUP_CHUNK
         )
+        encode_buffers = [self.alloc_scratch(f"encode_buffer_{i}", VLEN) for i in range(2)] if preencode else []
+        encode_src = self.alloc_scratch("encode_src") if preencode else None
+        encode_dst = self.alloc_scratch("encode_dst") if preencode else None
+        encoded_address_five = self.alloc_scratch("encoded_address_five") if preencode else None
         idx = self.alloc_scratch("idx", batch_size)
         val = self.alloc_scratch("val", batch_size)
         input_addrs = self.alloc_scratch("input_addrs", chunk_count)
@@ -679,6 +697,32 @@ class KernelBuilder:
 
         def select(dest, cond, left, right, *deps):
             return emit("flow", ("vselect", dest, cond, left, right), *deps)
+
+        encoded_levels_ready = {}
+        if preencode:
+            emit_context.update(chunk=SETUP_CHUNK, round=-1, local_seq=0)
+            source_ready = emit("load", ("const", encode_src, forest_values_p + encode_node_first))
+            dest_ready = emit("load", ("const", encode_dst, forest_values_p + n_nodes))
+            encoded_address_ready = emit("load", ("const", encoded_address_five, 5 + n_nodes - encode_node_first))
+            buffer_ready = [None] * len(encode_buffers)
+            vector_no = 0
+            for level in range(encode_first, encode_last + 1):
+                level_stores = []
+                for _ in range((1 << level) // VLEN):
+                    bank = vector_no % len(encode_buffers)
+                    tmp = encode_buffers[bank]
+                    read = emit("load", ("vload", tmp, encode_src), source_ready, buffer_ready[bank])
+                    encoded = emit("valu", ("^", tmp, tmp, final_xor_vec), read)
+                    written = emit("store", ("vstore", encode_dst, tmp), dest_ready, encoded)
+                    level_stores.append(written)
+                    buffer_ready[bank] = written
+                    vector_no += 1
+                    if vector_no * VLEN < self.preencoded_node_count:
+                        source_ready = emit("alu", ("+", encode_src, encode_src, address_step), read)
+                        dest_ready = emit("alu", ("+", encode_dst, encode_dst, address_step), written)
+                encoded_levels_ready[level] = level_stores
+            setup_deadline_end = len(ops)
+            emit_context.update(chunk=-1, round=-1, local_seq=0)
 
         # Keep these scalar addresses live through output stores, avoiding
         # a separate flow add_imm for each chunk at the end of execution.
@@ -1031,9 +1075,15 @@ class KernelBuilder:
                         "valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected
                     )
                 else:
+                    encoded_node = preencode and encode_first <= depth <= encode_last
+                    address_constant = encoded_address_five if encoded_node else address_five
+                    # Rebase addresses without extra per-lane arithmetic.
+                    # Dynamic gathers may read any node in their level, so
+                    # every copy-store for that level must have committed.
+                    extra_ready = [encoded_address_ready, *encoded_levels_ready[depth]] if encoded_node else []
                     # Decode only gathered addresses; cached lookup uses S.
                     address_ready = [
-                        emit("alu", ("-", chunk_node + lane, address_five, chunk_idx + lane), idx_ready)
+                        emit("alu", ("-", chunk_node + lane, address_constant, chunk_idx + lane), idx_ready, extra_ready)
                         for lane in range(VLEN)
                     ]
                     node_loads = [
@@ -1044,14 +1094,15 @@ class KernelBuilder:
                         )
                         for lane in range(VLEN)
                     ]
-                    node_loads = [
-                        emit(
-                            "alu",
-                            ("^", chunk_node + lane, chunk_node + lane, final_xor_const),
-                            node_loads[lane],
-                        )
-                        for lane in range(VLEN)
-                    ]
+                    if not encoded_node:
+                        node_loads = [
+                            emit(
+                                "alu",
+                                ("^", chunk_node + lane, chunk_node + lane, final_xor_const),
+                                node_loads[lane],
+                            )
+                            for lane in range(VLEN)
+                        ]
 
                     val_ready = emit(
                         "valu",
@@ -1207,17 +1258,40 @@ class KernelBuilder:
                     ops[writer]["deps"].append(previous_use)
                 previous_use = reader
         self.prune_unused_constants(ops, node_pool_uses)
+        if preencode:
+            # DCE removes only constants emitted before the copy sequence.
+            setup_deadline_end -= self.pruned_constant_loads
+            self.prioritize_setup_by_first_use(ops, setup_deadline_end)
         self.schedule(ops)
         # Reclaim index storage only after its actual last scheduled access.
         # Final-cache groups have no index uses in their second traversal.
         self.allocate_node_lifetimes(ops, node_pool_uses,
-                                     tuple(depth4_vectors if cache_depth4 else ()) +
+                                     tuple(depth4_vectors if cache_depth4 else ()) + tuple(encode_buffers) +
                                      tuple(range(idx, idx + batch_size, VLEN)))
         for bundle in self.instrs:
             for op, dest, left, right in bundle.pop("alu_vector", ()):
                 bundle.setdefault("alu", []).extend(
                     (op, dest + lane, left + lane, right + lane) for lane in range(VLEN)
                 )
+
+    def prioritize_setup_by_first_use(self, ops, setup_end):
+        """Delay setup priority to its first consuming round, without new deps.
+
+        This only changes scheduling metadata. Memory-copy dependencies stay
+        intact. An explicit prefix boundary separates setup from body ops.
+        """
+        needed = [len(ops)] * len(ops)
+        for i, op in enumerate(ops):
+            if i >= setup_end and op["round"] >= 0:
+                needed[i] = op["round"]
+        for i in range(len(ops) - 1, -1, -1):
+            for dep in ops[i]["deps"]:
+                if dep is not None:
+                    assert dep < i, "Setup deadlines require a forward DAG"
+                    needed[dep] = min(needed[dep], needed[i])
+        for i, op in enumerate(ops):
+            if i < setup_end:
+                op["round"] = min(4, needed[i])
 
     def prune_unused_constants(self, ops, uses):
         """Remove unread, dependency-free constants after the full DAG exists.

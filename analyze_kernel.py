@@ -50,6 +50,7 @@ def analyze(builder):
         "policy": builder.schedule_policy,
         "offloaded_vector_ops": len(builder.offloaded_ops),
         "pruned_constant_loads": builder.pruned_constant_loads,
+        "preencoded_nodes": builder.preencoded_node_count,
         "engines": engines,
         "gather": {
             "first": min(gathers), "last": max(gathers), "slots": len(gathers),

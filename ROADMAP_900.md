@@ -1,5 +1,35 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 30, **994 cycles**, scratch
+**1,432**, parent `95ca48d`. Runtime preprocessing encodes the 112 tree
+nodes at depths 4--6 into the first 112 words of the unused input-index
+region. The forest is unchanged. Gather addresses are rebased with a
+different existing subtraction constant, and 101 repeated per-vector node
+encodings disappear. Including 14 vector copies/XORs and 26 scalar pointer
+updates, net compute falls by **83.75 vector-equivalents**. Setup priorities
+follow first use; memory dependencies remain explicit. Full acceptance and
+memory-boundary checks pass. Disable with `NODE_PREENCODE_DEPTH = 0` to
+recover the 995-cycle parent behavior without this workspace usage.
+
+Current work: **7,153.125** compute equivalents, **1,923 loads**, **939 flow**,
+**46 stores**. This improves the optimistic compute floor from 965 to 954,
+but raises the load floor from 953 to 962. Actual cycles improve by only
+ONE: do not present the operation reduction as a comparable elapsed-time
+gain. First/last gather 61/983, drain 10. At 900 the remaining necessary
+deficits are **403.125 compute equivalents, 123 loads, 39 flow operations**.
+
+Next gate: do not enlarge preprocessing just because it removes more XORs.
+Depths 4--7 remove more compute but add too many loads; additional cached
+groups, coefficient-first lookup mixes, early ALU reservation, and static
+hash offload were tested without further gains. The binding question is how
+to remove gather traffic AND body work without adding flow congestion or a
+longer startup. Direct-address and logical-hazard reconstruction experiments
+also failed to beat the parent. See iteration 30's rejection table before
+repeating these approaches. The 994-cycle result is still 94 cycles from
+900, and 125 from the **869 snapshot**, which has not been rechecked here.
+
+The entries below, including their "current" budgets, are historical.
+
 Latest accepted implementation: iteration 29, **995 cycles**, scratch
 **1,421**, parent `9466e38`. Paired input-address anchors remove 15 net
 load slots; scalar parity constants remove one setup broadcast. Official,
