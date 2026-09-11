@@ -53,6 +53,7 @@ PATH_REUSE_DEPTH = 4
 DIRECT_PATH_DEPTH = 4
 ALU_VECTOR_BACKLOG = 12
 ALU_VECTOR_RESERVE_START = 60
+INPUT_ADDRESS_CHAIN_LENGTH = 2
 
 
 class KernelBuilder:
@@ -439,6 +440,7 @@ class KernelBuilder:
         Build a SIMD kernel and list-schedule all vector chunks together.
         """
         assert batch_size % VLEN == 0
+        assert INPUT_ADDRESS_CHAIN_LENGTH >= 1
         assert PATH_REUSE_DEPTH in (0, 2, 3, 4)
         assert DIRECT_PATH_DEPTH in (0, 2, 3, 4) and DIRECT_PATH_DEPTH <= PATH_REUSE_DEPTH
         # Legacy lookup experiments below used positive addresses. Reject
@@ -483,10 +485,15 @@ class KernelBuilder:
         # A'=2*A-5-p becomes S'=2*S+p: one multiply_add.
         depth2_left_base = vector_const((-6) & 0xFFFFFFFF, "depth2_left_base")
         depth2_right_base = vector_const((-8) & 0xFFFFFFFF, "depth2_right_base")
-        one = vector_const(1, "one")
+        # Active lookup modes use scalar parity extraction. Keep the vector
+        # alias for non-direct experimental modes, without broadcasting it on
+        # the scored direct path.
+        one = (vector_const(1, "one") if DIRECT_PATH_DEPTH < 3
+               else self.scratch_const(1, "one"))
         two = vector_const(2, "two")
         forest_values_scalar = self.scratch_const(forest_values_p, "forest_values_scalar")
         address_five = self.scratch_const(5)
+        address_step = self.scratch_const(VLEN)
         final_xor_vec = vector_const(HASH_STAGES[-1][1], "final_xor")
         final_xor_const = self.const_map[HASH_STAGES[-1][1]]
         top_nodes = self.alloc_scratch("top_nodes", VLEN)
@@ -675,11 +682,18 @@ class KernelBuilder:
 
         # Keep these scalar addresses live through output stores, avoiding
         # a separate flow add_imm for each chunk at the end of execution.
-        input_addr_ready = [
-            emit("load", ("const", input_addrs + chunk_no,
-                          inp_values_p + chunk_no * VLEN))
-            for chunk_no in range(chunk_count)
-        ]
+        # Default: one independent anchor per pair avoids a long address chain
+        # while replacing half of these load slots with scalar additions.
+        input_addr_ready = []
+        for chunk_no in range(chunk_count):
+            if chunk_no % INPUT_ADDRESS_CHAIN_LENGTH == 0:
+                ready = emit("load", ("const", input_addrs + chunk_no,
+                                      inp_values_p + chunk_no * VLEN))
+            else:
+                ready = emit("alu", ("+", input_addrs + chunk_no,
+                                     input_addrs + chunk_no - 1, address_step),
+                             input_addr_ready[-1])
+            input_addr_ready.append(ready)
 
         for chunk_no in range(chunk_count):
             emit_context.update(chunk=chunk_no, round=-1, local_seq=0)
@@ -1151,7 +1165,7 @@ class KernelBuilder:
                     # colored over all consumers without inserting copies.
                     parity_dest = path_bits_base + (round_no * chunk_count + chunk_no) * VLEN
                     path_bit_uses.append((parity_dest, len(ops)))
-                parity = emit_scalar_vector(
+                parity = emit_scalar_rhs(
                     "&", parity_dest, chunk_val, one, val_ready
                 )
                 if depth < retained_depth:

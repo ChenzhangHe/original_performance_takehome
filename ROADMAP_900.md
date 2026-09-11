@@ -1,5 +1,47 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 29, **995 cycles**, scratch
+**1,421**, parent `9466e38`. Paired input-address anchors remove 15 net
+load slots; scalar parity constants remove one setup broadcast. Official,
+built-in, 32-seed and six-extra-shape acceptance passes. Longer address
+chains, wider one-hop address fans, and vectorizing parity/address decoding
+were tested and rejected. See the log for measured results.
+
+Current work: **7,236.875** compute equivalents, **1,906** loads and **939**
+flow operations. This is one MORE compute equivalent than iteration 28,
+but better load/compute balance lowers elapsed cycles by three. Necessary
+deficits at 900 remain **486.875 compute equivalents, 106 loads, 39 flow**,
+before startup and dependencies. First/last gather: 60/983; drain: 11.
+
+### Public target calibration — checked 2026-09-10 PDT
+
+The community leader is now **869**, not approximately 1,000. Both
+[Paradigm's board](https://www.paradigm.xyz/puzzles/anthropic-challenge)
+and the [VLIW board's Without Indices category](https://vliw-challenge.fly.dev/)
+show 869. Paradigm's tenth entry is 900 and `@zartbotF` is twelfth at 908.
+VLIW's separate With Indices leader is 899; our kernel does not output final
+indices, so that category is not a valid direct comparison. These are
+community judge results, not Anthropic's unpublished best-human result.
+See [LEADERBOARD_NOTES.md](LEADERBOARD_NOTES.md) for timestamp and sources.
+
+Our local 995 needs 95 fewer cycles to reach 900 and 126 to reach 869.
+No solution was submitted to either board. The current compute floor of
+965 is a property of OUR emitted work, not a lower bound on the problem.
+Do not use it to argue that the published 869 is impossible.
+
+Next prioritize **joint lookup/representation and instruction selection**:
+seek net body-operation deletions, explicitly budget setup and live storage,
+then choose which engine executes the surviving work. Corsix's
+[analysis](https://www.corsix.org/content/anthropics-compiler-challenge)
+emphasizes balancing ALU/VALU, load and flow in each cycle, not only in
+aggregate; our paired-anchor win and long-chain regressions illustrate that
+distinction. The diagram's hash fusion is already present in our kernel;
+do not count it as a new opportunity. Keep hash search bounded and require
+full 32-bit equivalence for any proposed identity. Small initialization wins
+alone do not constitute a route to 900.
+
+The previous status entries below are historical checkpoints.
+
 Latest accepted implementation: iterations 27/28, **998 cycles**, scratch
 **1,436**. This session improves 1,004 -> 1,001 -> 998. A single group uses
 the final-round depth-4 cache, allowing its entire second traversal's index

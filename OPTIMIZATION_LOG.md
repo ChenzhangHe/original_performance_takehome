@@ -1403,3 +1403,65 @@ at least 485.875 fewer compute equivalents, 121 fewer load slots and 39
 fewer flow slots to fit the ideal 900-cycle capacities. The target is not
 achieved. Add a dead-code audit after future representation rewrites, and
 continue counting setup costs and readiness alongside body work.
+
+## Iteration 29 — short input-address chains and scalar parity constants
+
+Parent `9466e38`. Accepted result **995 cycles**, scratch **1,421**.
+Instead of loading all 32 input addresses as constants, load 16 independent
+even-group anchors and derive each following address with one ALU addition
+of VLEN. Addresses remain live through output stores. This adds 16 scalar
+operations but deletes 16 address loads; the previously dead scalar constant
+8 becomes live, so the NET deletion is 15 loads. There is no runtime-input
+specialization, memory rewriting, or simulator change.
+
+All active parity operations can use the same scalar constant 1 rather than
+eight broadcast copies. Use `emit_scalar_rhs` and omit that broadcast for
+the direct path. Keep the vector alias in non-direct experimental modes.
+This removes one setup VALU operation and seven fixed scratch words. Alone
+it ties the 998-cycle parent at scratch 1,429; combined with paired anchors
+it preserves the 995-cycle result and reduces scratch from 1,428 to 1,421.
+
+Bounded startup experiments against the parent, with frozen seed 123:
+
+| Address strategy | Group / chain sizes | Cycles |
+| --- | --- | --- |
+| flow add_imm chains | 2 / 4 / 8 / 16 | 1,012 / 1,014 / 1,019 / scratch overflow |
+| ALU chains | 2 / 4 / 8 / 16 / 32 | 995 / 1,000 / 1,008 / 1,029 / scratch overflow |
+| one-hop ALU fan from each group anchor | 2 / 4 / 8 / 16 / 32 | 995 / 999 / 1,001 / 1,004 / 1,015 |
+| interleaved ALU chains, number of anchors | 2 / 4 / 8 / 16 / 32 | 1,024 / 1,017 / 1,010 / 998 / 998 |
+
+Longer chains remove more load slots but delay input readiness; some also
+increase live scratch beyond 1,536. One-hop fans require more offset
+constants. Neither raw load counts nor depth alone predicts the winner.
+On the paired-anchor + scalar-one graph, lowering parity as VALU gives
+1,032, lowering gather-address decoding as VALU gives 1,000, and doing both
+gives 1,031. Moving gathered-node encoding into scalar input XOR followed
+by vector constant XOR ties 995. Reject all four alternatives. No scheduler
+priority sweep was added. The tuner now exposes `--input-address-chain-length`;
+1 disables chaining, 2 is the accepted default.
+
+Accepted slots: load **1,906**, VALU **5,870**, ALU **10,935**, flow **939**,
+store **32**. Weighted compute **7,236.875**, one ABOVE the parent: +16/8
+from address additions, -1 from the omitted broadcast. This is a measured
+resource-balance improvement, not a net arithmetic reduction. 326 vector
+operations offload to ALU. Selected policy remains an existing candidate,
+`balanced_adaptive_tail_hetero_360_220_140_140_900`. DCE removes 10 constants.
+First/last gather **60/983**, drain **11**, gather slots **1,832**.
+Floors: load 953, VALU 979, ALU 912, flow 939; optimistic combined compute
+floor 965. At 900 the necessary deficits remain 486.875 compute equivalents,
+106 loads and 39 flow operations, excluding dependencies and startup costs.
+
+Acceptance: official **9/9**, built-in **3/3**, frozen seeds **1000--1031**,
+and six extra shapes x seeds **123/456/789** pass. Extra-shape cycles in
+the established order: **72,150,350,751,590,1614**. Alternate (PATH,DIRECT)
+modes (0,0)/(2,2)/(3,3) also pass three seeds at 1,028/1,022/1,006 cycles.
+Those are compatibility checks, not tuning claims; some experimental modes
+regress relative to their old schedules. Tests and `problem.py` remain
+unchanged relative to `origin/main`.
+
+Public calibration: the live community boards show **869** as the current
+leader, Paradigm's tenth entry is **900**, and `@zartbotF` is at **908**.
+The separate VLIW With Indices leader is **899**, not directly comparable
+to our no-final-index output. Record sources, timestamp, and limitations in
+`LEADERBOARD_NOTES.md`. No board submission or login was performed. The
+current DAG's floor is not a lower bound for all possible algorithms.
