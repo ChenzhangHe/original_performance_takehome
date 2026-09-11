@@ -46,9 +46,10 @@ PAIR_LOOKUP_DEPTH = 3
 DEPTH3_COEFF_SELECT = True
 DEPTH4_BIT_SELECT = True
 NODE_VIRTUAL_VECTORS = 5
-DEPTH4_CACHE_CHUNKS = 26
+DEPTH4_CACHE_CHUNKS = 25
 DEPTH4_CACHE_ROUNDS = (4,)
 PATH_REUSE_DEPTH = 4
+DIRECT_PATH_DEPTH = 4
 
 
 class KernelBuilder:
@@ -415,6 +416,7 @@ class KernelBuilder:
         """
         assert batch_size % VLEN == 0
         assert PATH_REUSE_DEPTH in (0, 2, 3, 4)
+        assert DIRECT_PATH_DEPTH in (0, 2, 3, 4) and DIRECT_PATH_DEPTH <= PATH_REUSE_DEPTH
         # Legacy lookup experiments below used positive addresses. Reject
         # those switches until their formulas are ported to S=5-A as well.
         assert (LOOKUP_DEPTH == PAIR_LOOKUP_DEPTH == 3
@@ -474,11 +476,17 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", depth1_left_vec, depth1_left))
 
         def prepare_pairs(first, count, address):
+            # Direct lookup uses F1+p*(F0-F1), with p the latest path bit.
+            # Only the legacy path needs the address-dependent intercept below.
             # For a pair starting at A0, D=F0-F1 and E=F0+(A0-5)*D.
             # Thus F[A] = (5-A)*D+E, including wraparound arithmetic.
             # The setup-only zero word is dead after copying the raw root.
             for offset in range(0, count, 2):
                 intercept, slope = first + offset, first + offset + 1
+                if address < forest_values_p + (1 << (DIRECT_PATH_DEPTH + 1)) - 1:
+                    # Keep D,F1 in place; permute the broadcast references.
+                    self.add("alu", ("-", intercept, intercept, slope))
+                    continue
                 base = self.scratch_const(address + offset)
                 self.add("alu", ("-", slope, intercept, slope))
                 self.add("alu", ("-", zero, base, address_five))
@@ -538,6 +546,13 @@ class KernelBuilder:
                     vector = self.alloc_scratch(f"depth4_coef_{address}_{lane}", VLEN)
                     self.add("valu", ("vbroadcast", vector, top_nodes + lane))
                     depth4_vectors.append(vector)
+
+        if DIRECT_PATH_DEPTH >= 2:
+            depth2_vectors = [depth2_vectors[i ^ 1] for i in range(4)]
+        if DIRECT_PATH_DEPTH >= 3:
+            depth3_vectors = [depth3_vectors[i ^ 1] for i in range(8)]
+        if DIRECT_PATH_DEPTH >= 4 and cache_depth4:
+            depth4_vectors = [depth4_vectors[i ^ 1] for i in range(16)]
 
         # Stages 2/3 become two independent affine arms followed by XOR.
         # All coefficients are reduced modulo the machine's 32-bit word size.
@@ -655,7 +670,8 @@ class KernelBuilder:
 
             def lookup_mask(bit, destination, *deps):
                 # Bit j of S at depth d is parity from depth d-1-j.
-                # Retain the original dependencies while removing extraction.
+                # Retain explicit overwrite dependencies. Direct interpolation
+                # can omit the index barrier, but must wait for its own parity.
                 if depth <= PATH_REUSE_DEPTH and depth - 1 - bit in path_bits:
                     address, producers = path_bits[depth - 1 - bit]
                     ready = list(producers)
@@ -678,10 +694,16 @@ class KernelBuilder:
                         and round_no + 4 in DEPTH4_CACHE_ROUNDS
                     ):
                         reuse_depth = 3
+                    retained_depth = max(reuse_depth - 1, min(DIRECT_PATH_DEPTH, reuse_depth))
                 cached_lookup = (0 < depth <= LOOKUP_DEPTH) or (
                     depth == 4 and cache_depth4 and chunk_no < DEPTH4_CACHE_CHUNKS
                     and round_no in DEPTH4_CACHE_ROUNDS
                 )
+                direct_lookup = cached_lookup and 2 <= depth <= DIRECT_PATH_DEPTH
+                interpolation, interpolation_ready = (
+                    path_bits[depth - 1] if direct_lookup else (chunk_idx, idx_ready)
+                )
+                lookup_barrier = None if direct_lookup else idx_ready
                 # A gathered node dies at the input XOR, before hash tmp2 use.
                 chunk_node = (node_or_addr + chunk_no * NODE_VIRTUAL_VECTORS * VLEN
                               if cached_lookup else chunk_tmp2)
@@ -714,7 +736,7 @@ class KernelBuilder:
                             depth2_right_base, selected,
                         )
                 elif depth == 2 and LOOKUP_DEPTH >= 2 and PAIR_LOOKUP_DEPTH >= 2:
-                    half_mask, half = lookup_mask(1, chunk_tmp1, idx_ready)
+                    half_mask, half = lookup_mask(1, chunk_tmp1, lookup_barrier)
                     slope = select(
                         chunk_node, half_mask, depth2_vectors[1], depth2_vectors[3], half
                     )
@@ -722,8 +744,8 @@ class KernelBuilder:
                         chunk_tmp2, half_mask, depth2_vectors[0], depth2_vectors[2], half
                     )
                     selected = emit(
-                        "valu", ("multiply_add", chunk_node, chunk_idx, chunk_node, chunk_tmp2),
-                        slope, intercept,
+                        "valu", ("multiply_add", chunk_node, interpolation, chunk_node, chunk_tmp2),
+                        slope, intercept, interpolation_ready,
                     )
                     val_ready = emit(
                         "valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected
@@ -762,7 +784,7 @@ class KernelBuilder:
                 elif depth == 3 and LOOKUP_DEPTH >= 3 and PAIR_LOOKUP_DEPTH >= 3 and DEPTH3_COEFF_SELECT:
                     upper_d = chunk_node + VLEN
                     final_mask = chunk_node + 2 * VLEN
-                    lower_mask, lower_half = lookup_mask(1, chunk_tmp1, idx_ready)
+                    lower_mask, lower_half = lookup_mask(1, chunk_tmp1, lookup_barrier)
                     # Pair starts A=14,16,18,20 map to S=-9,-11,-13,-15;
                     # (S >> 1)&3 gives 3,2,1,0 for both members of each pair.
                     lower_slope = select(chunk_node, lower_mask, depth3_vectors[5], depth3_vectors[7], lower_half)
@@ -773,7 +795,7 @@ class KernelBuilder:
                     slope = select(chunk_node, final_mask, upper_d, chunk_node, half, lower_slope, upper_slope)
                     intercept = select(chunk_tmp2, final_mask, chunk_tmp1, chunk_tmp2, half, lower_intercept, upper_intercept)
                     selected = emit(
-                        "valu", ("multiply_add", chunk_node, chunk_idx, chunk_node, chunk_tmp2), slope, intercept
+                        "valu", ("multiply_add", chunk_node, interpolation, chunk_node, chunk_tmp2), slope, intercept, interpolation_ready
                     )
                     val_ready = emit("valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected)
                 elif depth == 3 and LOOKUP_DEPTH >= 3 and PAIR_LOOKUP_DEPTH >= 3:
@@ -877,14 +899,14 @@ class KernelBuilder:
                     # fewer selects. Share the three low-bit masks.
                     masks = [chunk_node + n * VLEN for n in (2, 3, 4)]
                     auxiliary = masks[2]
-                    masks[0], mask0 = lookup_mask(1, masks[0], idx_ready)
+                    masks[0], mask0 = lookup_mask(1, masks[0], lookup_barrier)
                     mask1 = None
                     order = sorted(range(8), key=lambda p: ((5 - 22 - 2*p) >> 1) & 7)
                     def quartet(pair, dest, *deps):
                         p, q = order[pair:pair+2]
                         slope = select(chunk_tmp1, masks[0], depth4_vectors[2*q+1], depth4_vectors[2*p+1], mask0, *deps)
                         intercept = select(chunk_tmp2, masks[0], depth4_vectors[2*q], depth4_vectors[2*p], mask0, *deps)
-                        return emit("valu", ("multiply_add", dest, chunk_idx, chunk_tmp1, chunk_tmp2), slope, intercept)
+                        return emit("valu", ("multiply_add", dest, interpolation, chunk_tmp1, chunk_tmp2), slope, intercept, interpolation_ready)
                     def octet(pair, dest, *deps):
                         nonlocal mask1
                         lower = quartet(pair, dest, *deps)
@@ -1066,7 +1088,7 @@ class KernelBuilder:
                 # Encoded hash parity p is the inverse of raw hash parity.
                 # Keep p at the root, then use S'=2*S+p at deeper levels.
                 parity_dest = chunk_idx if depth == 0 else chunk_tmp1
-                if depth < reuse_depth - 1:
+                if depth < retained_depth:
                     # Unique logical producer per group/round; its storage is
                     # colored over all consumers without inserting copies.
                     parity_dest = path_bits_base + (round_no * chunk_count + chunk_no) * VLEN
@@ -1074,7 +1096,7 @@ class KernelBuilder:
                 parity = emit_scalar_vector(
                     "&", parity_dest, chunk_val, one, val_ready
                 )
-                if depth < reuse_depth - 1:
+                if depth < retained_depth:
                     path_bits[depth] = (parity_dest, parity)
                 if depth == 0:
                     idx_ready = parity

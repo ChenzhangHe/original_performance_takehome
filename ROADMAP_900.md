@@ -1,5 +1,19 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 25, **1,013 cycles**, scratch
+**1,468**. A is complete; B now uses direct parity interpolation with early
+coefficient selection. It preserves incremental index updates: delaying
+their reconstruction alone offers no operation-count saving on this scored
+shape. Weighted compute is 7,237.875 (optimistic floor 966), load 1,948
+(floor 974), flow 915. Full acceptance passes. C's first bounded template
+pass found no shorter Hash; see `hash_fusion_probe.py` and the log.
+
+Next: examine issue balance on this changed DAG with a bounded experiment,
+then seek a different expression/state transformation or lower-cost lookup.
+At 900 the remaining necessary deficits are 487.875 compute equivalents,
+148 load slots and 15 flow slots. Do not count early lookup as eliminated
+address computation or treat the rejected Hash templates as a minimality proof.
+
 Latest accepted implementation: iteration 24, **1,017 cycles**, scratch
 **1,453**. Plan A below is implemented: retained parity eliminates all
 2,112 scalar masks at the old cache coverage with no copies. Retuning to

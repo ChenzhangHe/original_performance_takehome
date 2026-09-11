@@ -1244,3 +1244,51 @@ Official 9/9, built-in 3/3 and frozen seeds 1000--1031 pass on the final
 Tests/simulator unchanged. Add reproducible path-reuse/cache-coverage sweeps
 to the tuning helper. Next: direct parity interpolation before experimenting
 with delayed index reconstruction, keeping their costs separate.
+
+## Iteration 25 — interpolate with parity and select coefficients early
+
+Parent `fa086d7`. Result **1,013 cycles**, scratch **1,468**. Use
+`F1+p*(F0-F1)` at depths 2/3/cached 4. Setup stores D,F1 in place and swaps
+the vector references, requiring one subtraction per pair instead of four
+scalar operations; no physical swap/copy is emitted. Retain the newest
+parity until interpolation, in addition to the earlier lookup predicates.
+Coefficient selection can start before the complete index update; the MAC
+explicitly waits for its parity operand. Overwrite dependencies remain.
+
+At 26 cached chunks, direct interpolation alone at depths 2/3/4 gives
+1,017/1,018/1,018, not an improvement. With early coefficient selection,
+the same settings give 1,018/1,016/1,016. Full-depth early lookup at cache
+coverage 22/23/24/25/26/27 gives 1,020/scratch-overflow/1,014/1,013/1,016/1,018.
+The 23-chunk candidate is rejected; retain 25. All non-overflow candidates
+in these sweeps pass seeds 123/456/789. An initial copy-based coefficient
+setup also regressed (1,018/1,018/1,020) and was replaced by reference swaps.
+
+Final slots: load 1,948; VALU 5,964; ALU 10,191; flow 915; store 32.
+Weighted work 7,237.875 (down 7.25: 5.25 setup plus 2 from lower cache
+coverage). First/last gather 65/1,000, drain 12. Selected policy
+`adaptive_tail_hetero_360_240_240_220_900`, 230 vector offloads. Official
+9/9, built-in 3/3, seeds 1000--1031 and six extra shapes x three seeds pass.
+Extra-shape cycles: 73,152,362,754,592,1616. Tests/simulator unchanged.
+
+Address-update work is NOT removed in this commit. For the scored shape,
+reconstructing S at the first gather at depth 4 requires the same one base
+select plus three compute operations as incremental updates; depth 5 needs
+one select plus four compute operations. Merely postponing those operations
+does not save work. Full omission would need a traversal ending entirely in
+cached lookups; the scored final depth-4 round still gathers every group.
+
+## Hash search diagnostic — first bounded template pass
+
+Add `hash_fusion_probe.py`, a standalone read-only candidate filter. For
+stages 0/1 and stages 4/5 with raw output, test whether T(m*x+b)^c can be
+rewritten as T(k*x+d), where T(x)=x^(x>>shift). Inverting T and evaluating
+x=0,1 uniquely determines k,d; x=2 is a counterexample in both cases.
+This rules out those particular affine-absorption templates, not arbitrary
+shorter instruction sequences.
+
+For fused stages 2/3/4, test 7,040 two-affine-arm/XOR templates using the
+original, scaled and negated multipliers and a bounded derived constant set.
+All are rejected against the 4,238-input deterministic test pool (evaluation
+stops at the first counterexample for each candidate). No survivor or new
+Hash identity is claimed. Any future survivor still requires a full 32-bit
+equivalence proof and the normal kernel acceptance checks.
