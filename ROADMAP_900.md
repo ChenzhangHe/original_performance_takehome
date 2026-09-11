@@ -1,5 +1,12 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 24, **1,017 cycles**, scratch
+**1,453**. Plan A below is implemented: retained parity eliminates all
+2,112 scalar masks at the old cache coverage with no copies. Retuning to
+26 cached chunks yields weighted work 7,245.125, load 1,941, flow 926.
+Full acceptance passes. Next is plan B, starting with direct interpolation
+separately from address reconstruction. Earlier baselines below are historical.
+
 Current accepted result: iteration 23, **1,037 cycles**, scratch **1,357**.
 Negative indices plus shared-mask quartet interpolation allow 24 cached
 round-4 chunks. Full acceptance passes. Floors: load 979, VALU 1,016,
@@ -21,7 +28,8 @@ but cannot by itself lower the aggregate compute bound to 900.
 
 Implementation baseline: `d81dfe0`, **1,037 cycles**. The plan below supersedes
 the older experiment ordering later in this file. It is a documentation-only
-update: none of these candidates has been implemented or benchmarked yet.
+update at that time. Subsequent execution status is recorded at the top of
+this file and in the numbered optimization log; A is now implemented.
 
 ### Measured compute budget
 

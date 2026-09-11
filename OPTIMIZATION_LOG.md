@@ -1215,3 +1215,32 @@ Each experiment must report net work and the remaining load/flow budget,
 then pass full acceptance before an implementation is committed as a gain.
 No kernel, simulator or test files changed in this planning update; runtime
 tests are not rerun for documentation-only changes.
+
+## Iteration 24 — retain parity producers across shallow lookups
+
+Parent implementation `d81dfe0`; plan `31ac567`. Result **1,017 cycles**,
+scratch **1,453**. Each retained parity producer has a unique logical vector
+and its lifetime includes all later lookup consumers. Root lookup reads that
+vector directly; no copy is inserted. Select predicates use earlier 0/1
+parity instead of extracting 0/2, 0/4 or 0/8 from S. Original dependencies
+are preserved, so early preselection is not mixed into this experiment.
+
+At the original 24 cached chunks, reuse depths 0/2/3/4 give
+1,037/1,033/1,022/1,021 cycles and scratch 1,357/1,389/1,429/1,453.
+Each passes frozen seeds 123/456/789. Full depth-4 reuse deletes exactly
+2,112 scalar masks with no added copies or setup work: weighted work falls
+from 7,505.125 to 7,241.125. This confirms plan A's gross savings in the DAG.
+
+Cache coverage sweep 20/22/23/24/25/26/27/28 gives
+1,035/1,027/1,023/1,021/1,017/1,017/1,024/1,029. Retain 26, reducing
+load pressure relative to the tied 25. Final slots: load 1,941; VALU 5,971;
+ALU 10,193; flow 926; store 32. Weighted compute 7,245.125; first/last
+gather 74/1,001, drain 15. Selected policy
+`adaptive_tail_hetero_360_220_220_140_750`, 227 adaptive vector offloads.
+
+Official 9/9, built-in 3/3 and frozen seeds 1000--1031 pass on the final
+26-chunk candidate. The six extra shapes x seeds 123/456/789 pass at
+88,152,382,765,598,1622 cycles; cache coverage does not affect these shapes.
+Tests/simulator unchanged. Add reproducible path-reuse/cache-coverage sweeps
+to the tuning helper. Next: direct parity interpolation before experimenting
+with delayed index reconstruction, keeping their costs separate.
