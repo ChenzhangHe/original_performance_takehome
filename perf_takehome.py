@@ -47,7 +47,8 @@ DEPTH3_COEFF_SELECT = True
 DEPTH4_BIT_SELECT = True
 NODE_VIRTUAL_VECTORS = 5
 DEPTH4_CACHE_CHUNKS = 26
-DEPTH4_CACHE_ROUNDS = (4,)
+DEPTH4_CACHE_ROUNDS = (4, 15)
+DEPTH4_FINAL_CACHE_CHUNKS = 1
 PATH_REUSE_DEPTH = 4
 DIRECT_PATH_DEPTH = 4
 ALU_VECTOR_BACKLOG = 12
@@ -449,9 +450,17 @@ class KernelBuilder:
         chunk_count = batch_size // VLEN
         # Cache coverage is tuned for the scored shape; retain the generic path
         # elsewhere, where different overlap can require more live scratch.
-        cache_depth4 = (forest_height, batch_size, rounds) == (10, 256, 16) and DEPTH4_CACHE_CHUNKS > 0 and any(
+        cache_depth4 = (forest_height, batch_size, rounds) == (10, 256, 16) and (DEPTH4_CACHE_CHUNKS > 0 or DEPTH4_FINAL_CACHE_CHUNKS > 0) and any(
             r < rounds and r % (forest_height + 1) == 4 for r in DEPTH4_CACHE_ROUNDS
         )
+        def depth4_cached(round_no, chunk_no):
+            if not cache_depth4 or round_no not in DEPTH4_CACHE_ROUNDS:
+                return False
+            if round_no == rounds - 1:
+                # The final coefficient tree uses all retained path parities.
+                return DIRECT_PATH_DEPTH >= 4 and chunk_no < DEPTH4_FINAL_CACHE_CHUNKS
+            return chunk_no < DEPTH4_CACHE_CHUNKS
+
         forest_values_p = 7
         inp_values_p = forest_values_p + n_nodes + batch_size
 
@@ -713,14 +722,19 @@ class KernelBuilder:
                     path_bits = {}
                     reuse_depth = min(PATH_REUSE_DEPTH, forest_height, rounds - 1 - round_no)
                     if reuse_depth >= 4 and not (
-                        cache_depth4 and chunk_no < DEPTH4_CACHE_CHUNKS
-                        and round_no + 4 in DEPTH4_CACHE_ROUNDS
+                        depth4_cached(round_no + 4, chunk_no)
                     ):
                         reuse_depth = 3
                     retained_depth = max(reuse_depth - 1, min(DIRECT_PATH_DEPTH, reuse_depth))
+                    # A traversal ending entirely in direct cached lookup
+                    # needs path bits, but no materialized index or address.
+                    needs_index = any(
+                        (d >= 2 and d > DIRECT_PATH_DEPTH) or
+                        (d > LOOKUP_DEPTH and not (d == 4 and depth4_cached(round_no + d, chunk_no)))
+                        for d in range(1, min(forest_height, rounds - 1 - round_no) + 1)
+                    )
                 cached_lookup = (0 < depth <= LOOKUP_DEPTH) or (
-                    depth == 4 and cache_depth4 and chunk_no < DEPTH4_CACHE_CHUNKS
-                    and round_no in DEPTH4_CACHE_ROUNDS
+                    depth == 4 and depth4_cached(round_no, chunk_no)
                 )
                 direct_lookup = cached_lookup and 2 <= depth <= DIRECT_PATH_DEPTH
                 interpolation, interpolation_ready = (
@@ -751,7 +765,7 @@ class KernelBuilder:
                         val_ready,
                         selected,
                     )
-                    if depth < forest_height and round_no < rounds - 1:
+                    if needs_index and depth < forest_height and round_no < rounds - 1:
                         # Next S is (p0 ? -6 : -8) + p1. Prepare its
                         # base while this round hashes, after the last p0 read.
                         idx_ready = select(
@@ -915,8 +929,30 @@ class KernelBuilder:
                     val_ready = emit(
                         "valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected
                     )
-                elif (depth == 4 and cache_depth4 and chunk_no < DEPTH4_CACHE_CHUNKS
-                      and round_no in DEPTH4_CACHE_ROUNDS and DEPTH4_BIT_SELECT):
+                elif (depth == 4 and depth4_cached(round_no, chunk_no)
+                      and round_no == rounds - 1):
+                    # Select coefficients before the newest parity arrives;
+                    # unlike quartet interpolation, only one MAC waits for it.
+                    intercept_result = chunk_node + VLEN
+                    masks = [path_bits[2][0], path_bits[1][0], path_bits[0][0]]
+                    mask_ready = [path_bits[2][1], path_bits[1][1], path_bits[0][1]]
+                    order = sorted(range(8), key=lambda p: ((5 - 22 - 2*p) >> 1) & 7)
+
+                    def coefficient_tree(values, destination, *deps):
+                        left = select(chunk_tmp1, masks[0], values[1], values[0], mask_ready[0], *deps)
+                        right = select(chunk_tmp2, masks[0], values[3], values[2], mask_ready[0], *deps)
+                        lower = select(destination, masks[1], chunk_tmp2, chunk_tmp1, left, right, mask_ready[1])
+                        left = select(chunk_tmp1, masks[0], values[5], values[4], lower)
+                        right = select(chunk_tmp2, masks[0], values[7], values[6], lower)
+                        upper = select(chunk_tmp1, masks[1], chunk_tmp2, chunk_tmp1, left, right, mask_ready[1])
+                        return select(destination, masks[2], chunk_tmp1, destination, lower, upper, mask_ready[2])
+
+                    slope = coefficient_tree([depth4_vectors[2*p+1] for p in order], chunk_node)
+                    intercept = coefficient_tree([depth4_vectors[2*p] for p in order], intercept_result, slope)
+                    selected = emit("valu", ("multiply_add", chunk_node, interpolation, chunk_node, intercept_result),
+                                    slope, intercept, interpolation_ready)
+                    val_ready = emit("valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected)
+                elif (depth == 4 and depth4_cached(round_no, chunk_no) and DEPTH4_BIT_SELECT):
                     upper_result = chunk_node + VLEN
                     # Four interpolations trade three extra MACs for three
                     # fewer selects. Share the three low-bit masks.
@@ -942,8 +978,7 @@ class KernelBuilder:
                     masks[2], mask2 = lookup_mask(3, masks[2], upper)
                     selected = select(chunk_node, masks[2], upper_result, chunk_node, lower, upper, mask2)
                     val_ready = emit("valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected)
-                elif (depth == 4 and cache_depth4 and chunk_no < DEPTH4_CACHE_CHUNKS
-                      and round_no in DEPTH4_CACHE_ROUNDS):
+                elif (depth == 4 and depth4_cached(round_no, chunk_no)):
                     auxiliary = chunk_node + VLEN
                     upper_result = chunk_node + 2 * VLEN
 
@@ -1124,6 +1159,9 @@ class KernelBuilder:
                 if depth == 0:
                     idx_ready = parity
                     continue
+                if not needs_index:
+                    idx_ready = None
+                    continue
                 if depth == 1:
                     idx_ready = emit_scalar_vector("+", chunk_idx, chunk_idx, parity_dest, parity, idx_ready)
                 else:
@@ -1154,13 +1192,47 @@ class KernelBuilder:
                 if previous_use is not None:
                     ops[writer]["deps"].append(previous_use)
                 previous_use = reader
+        self.prune_unused_constants(ops, node_pool_uses)
         self.schedule(ops)
-        self.allocate_node_lifetimes(ops, node_pool_uses, depth4_vectors if cache_depth4 else ())
+        # Reclaim index storage only after its actual last scheduled access.
+        # Final-cache groups have no index uses in their second traversal.
+        self.allocate_node_lifetimes(ops, node_pool_uses,
+                                     tuple(depth4_vectors if cache_depth4 else ()) +
+                                     tuple(range(idx, idx + batch_size, VLEN)))
         for bundle in self.instrs:
             for op, dest, left, right in bundle.pop("alu_vector", ()):
                 bundle.setdefault("alu", []).extend(
                     (op, dest + lane, left + lane, right + lane) for lane in range(VLEN)
                 )
+
+    def prune_unused_constants(self, ops, uses):
+        """Remove unread, dependency-free constants after the full DAG exists.
+
+        Lookup variants leave obsolete setup thresholds behind. This pass is
+        conservative: it does not remove memory reads, stores, or any constant
+        whose scratch word is read anywhere, even after a later overwrite.
+        """
+        reads = set()
+        for op in ops:
+            reads.update(self.instruction_accesses(op["engine"], op["slot"])[0])
+        dead = {
+            i for i, op in enumerate(ops)
+            if op["engine"] == "load" and op["slot"][0] == "const"
+            and op["slot"][1] not in reads
+            and not any(d is not None for d in op["deps"])
+        }
+        self.pruned_constant_loads = len(dead)
+        if not dead:
+            return
+        # Map operation IDs and half-open lifetime boundaries together.
+        prefix = [0]
+        for i in range(len(ops)):
+            prefix.append(prefix[-1] + (i not in dead))
+        kept = [op for i, op in enumerate(ops) if i not in dead]
+        for op in kept:
+            op["deps"] = [prefix[d] for d in op["deps"] if d is not None and d not in dead]
+        uses[:] = [(base, prefix[start], prefix[end], width) for base, start, end, width in uses]
+        ops[:] = kept
 
     def allocate_node_lifetimes(self, ops, uses, reusable=()):
         """Color node vectors after scheduling, preserving every issue cycle."""

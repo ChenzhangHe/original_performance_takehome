@@ -49,6 +49,7 @@ def analyze(builder):
         "scratch": builder.scratch_ptr,
         "policy": builder.schedule_policy,
         "offloaded_vector_ops": len(builder.offloaded_ops),
+        "pruned_constant_loads": builder.pruned_constant_loads,
         "engines": engines,
         "gather": {
             "first": min(gathers), "last": max(gathers), "slots": len(gathers),

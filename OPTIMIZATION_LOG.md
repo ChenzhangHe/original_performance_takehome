@@ -1328,3 +1328,78 @@ Remaining necessary deficits at 900: 489.875 compute equivalents, 140 load
 slots and 26 flow slots, before startup/dependency/drain costs. Next work
 needs a new state/expression transformation or cheaper lookup; do not resume
 an unbounded priority sweep or report the target as achieved.
+
+## Iteration 27 — final-round single-group cache and index liveness
+
+Parent `4442b25`. Intermediate result **1,001 cycles**, scratch **1,428**;
+combined with iteration 28 below in the next accepted commit. Keep depth-4
+coefficients available for group 0 in the final round. Its entire second
+traversal now uses direct cached lookup, so omit the base select and three
+index updates, not just the final gather. Other groups retain their gathers.
+The final lookup selects D/E with 14 flow operations and performs one MAC
+after the newest parity arrives; the first traversal retains its 11-flow,
+four-MAC quartet implementation. Reclaim each group's physical index vector
+only after its actual last scheduled read/write, using the existing interval
+colorer. Non-direct lookup modes still retain indices when needed.
+
+Compared with iteration 26: eight load slots and four compute equivalents
+disappear; flow increases by 13. Intermediate slots: load 1,932; VALU 5,883;
+ALU 10,823; flow 939; store 32. First/last gather 64/988, drain 12. Official
+9/9, built-in 3/3, frozen seeds 1000--1031 and six extra shapes x three seeds
+pass at this intermediate stage.
+
+Rejected structural experiments, kept out of the accepted kernel:
+
+- Direct positive addresses: accumulate weighted path bits into the first
+  real gather address, then prepare 2*A-5 during the hash and subtract parity
+  afterward. Weighted work falls from 7,239.875 to 7,181.875, but six extra
+  setup loads and changed readiness leave the best at 1,004. Cache coverage
+  24/25/26/27/28/29/30 gives 1,012/1,008/1,004/1,006/1,018/1,027/1,036;
+  coverage 20 exceeds scratch. Moving root base selection to MAC, using a
+  single-MAC depth-4 coefficient tree, or scalarizing early address MACs
+  also fails to beat 1,004. Scalar address MACs were tried both after all
+  lane loads and after each lane's own load. Lower work did not imply a
+  faster schedule on this graph.
+- Final quartet caching of 2/4/6 groups gives 1,004/1,011/1,028. The final
+  single-MAC coefficient tree gives 1,001/1,002/1,013/1,022 for 1/2/3/4
+  groups at first-round coverage 26. More final caching overloads flow.
+- Moving a one-group final cache from group 0 to groups 1/2/3/4/31 gives
+  1,003/1,004/1,004/1,004/1,012. Increasing first-round coverage to 27/28
+  with final group 0 gives 1,008/1,019. Retain first-round 26/final-round 1.
+- Root-base MACs with the negative index representation and final cache
+  do not improve 1,001. Reordering path bits and holding four partial
+  coefficients earlier also regresses (1,005 for one final group). All six
+  bit orders in the serial coefficient trees were checked: four tie 1,001,
+  the other two give 1,002 and 1,006. Keep the original order; moving work
+  earlier can compete with other useful flow operations.
+
+Main prototype sweeps used frozen seeds 123/456/789; some fine-grained
+positive-address coverage checks used seed 123 only. No rejected candidate
+is presented as having completed full acceptance.
+
+## Iteration 28 — remove unread setup constants after DAG construction
+
+Final accepted result **998 cycles**, scratch **1,436**, down six cycles
+from the start of this session. Inspection found 11 constant-load operations
+whose destination words are never read: old threshold/mask constants with
+values 4,8,12,18,20,24,26,28,32,34,36. The compiler pass does NOT hardcode
+this list: it checks reads in the completed operation graph and removes only
+unread, dependency-free constant loads. It does not delete memory loads,
+stores, or constants whose scratch words are read after an overwrite.
+Remap dependency IDs and half-open temporary lifetime ranges together.
+
+Final slots: load 1,921; VALU 5,882; ALU 10,831; flow 939; store 32.
+The change in VALU/ALU distribution is scheduling, not new arithmetic.
+Weighted work remains 7,235.875. Selected policy:
+`balanced_adaptive_tail_hetero_360_220_220_140_750`, 315 vector offloads.
+First/last gather 59/985, drain 12. Floors: load 961, VALU 981, ALU 903,
+flow 939; optimistic combined compute floor 965.
+
+Final official 9/9, built-in 3/3, frozen seeds 1000--1031 and six extra
+shapes x seeds 123/456/789 pass. Extra-shape cycles: 73,150,350,751,590,1614.
+The report exposes the number of pruned constant loads; the tuner exposes
+final-round cache coverage. Tests/simulator unchanged. The code still needs
+at least 485.875 fewer compute equivalents, 121 fewer load slots and 39
+fewer flow slots to fit the ideal 900-cycle capacities. The target is not
+achieved. Add a dead-code audit after future representation rewrites, and
+continue counting setup costs and readiness alongside body work.

@@ -43,14 +43,16 @@ def main():
         "HASH_ALU_CHUNKS", "BIT_MASK_VALU_CHUNKS", "PATH_REUSE_DEPTH",
         "DEPTH4_CACHE_CHUNKS", "DIRECT_PATH_DEPTH", "ALU_VECTOR_BACKLOG",
         "ALU_VECTOR_RESERVE_START",
+        "DEPTH4_FINAL_CACHE_CHUNKS",
     ):
         parser.add_argument("--" + name.lower().replace("_", "-"), type=int, nargs="+", default=[getattr(kernel, name)])
     parser.add_argument("--seeds", type=int, nargs="+", default=[123])
     args = parser.parse_args()
-    for hash_chunks, bit_mask_chunks, path_depth, cache_chunks, direct_depth, backlog, reserve_start in product(
+    for hash_chunks, bit_mask_chunks, path_depth, cache_chunks, direct_depth, backlog, reserve_start, final_cache_chunks in product(
         args.hash_alu_chunks, args.bit_mask_valu_chunks, args.path_reuse_depth,
         args.depth4_cache_chunks, args.direct_path_depth, args.alu_vector_backlog,
         args.alu_vector_reserve_start,
+        args.depth4_final_cache_chunks,
     ):
         kernel.HASH_ALU_CHUNKS = hash_chunks
         kernel.BIT_MASK_VALU_CHUNKS = bit_mask_chunks
@@ -59,6 +61,7 @@ def main():
         kernel.DIRECT_PATH_DEPTH = direct_depth
         kernel.ALU_VECTOR_BACKLOG = backlog
         kernel.ALU_VECTOR_RESERVE_START = reserve_start
+        kernel.DEPTH4_FINAL_CACHE_CHUNKS = final_cache_chunks
         start = time.perf_counter()
         builder = kernel.KernelBuilder()
         builder.build_kernel(10, 2047, 256, 16)
@@ -73,6 +76,7 @@ def main():
                               path_reuse_depth=path_depth, depth4_cache_chunks=cache_chunks,
                               direct_path_depth=direct_depth,
                               alu_vector_backlog=backlog, alu_vector_reserve_start=reserve_start,
+                              depth4_final_cache_chunks=final_cache_chunks,
                               cycles=cycles, scratch=builder.scratch_ptr, policy=builder.schedule_policy,
                               slots=dict(slots), checked_seeds=args.seeds, build_seconds=round(elapsed, 3))), flush=True)
 

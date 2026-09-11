@@ -1,5 +1,20 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iterations 27/28, **998 cycles**, scratch
+**1,436**. This session improves 1,004 -> 1,001 -> 998. A single group uses
+the final-round depth-4 cache, allowing its entire second traversal's index
+construction to disappear. Dead index storage is reused after its last
+access. A conservative post-build pass removes 11 unread constant loads.
+Full official, built-in, 32-seed and six-extra-shape acceptance passes.
+
+Current work is 7,235.875 compute equivalents, 1,921 loads and 939 flow
+operations. Necessary reductions at 900 are still 485.875 compute
+equivalents, 121 loads and 39 flow operations, before dependency/startup
+costs. Sub-1,000 is achieved; 900 is not. Direct positive-address construction,
+root MACs, larger final caches and early-bit lookup variants were tested and
+rejected; see the log before repeating them. Future structural changes must
+include a post-build dead-code audit, not just a body-instruction budget.
+
 Latest accepted implementation: iteration 26, **1,004 cycles**, scratch
 **1,460**. This session improves 1,037 -> 1,017 -> 1,013 -> 1,004.
 Path-parity reuse, direct interpolation/early lookup and bounded ALU issue
