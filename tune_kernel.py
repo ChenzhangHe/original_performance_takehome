@@ -40,19 +40,25 @@ def check(builder, seed, height=10, rounds=16, batch=256):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in (
-        "HASH_ALU_CHUNKS", "BIT_MASK_VALU_CHUNKS", "PATH_REUSE_DEPTH", "DEPTH4_CACHE_CHUNKS", "DIRECT_PATH_DEPTH",
+        "HASH_ALU_CHUNKS", "BIT_MASK_VALU_CHUNKS", "PATH_REUSE_DEPTH",
+        "DEPTH4_CACHE_CHUNKS", "DIRECT_PATH_DEPTH", "ALU_VECTOR_BACKLOG",
+        "ALU_VECTOR_RESERVE_START",
     ):
         parser.add_argument("--" + name.lower().replace("_", "-"), type=int, nargs="+", default=[getattr(kernel, name)])
     parser.add_argument("--seeds", type=int, nargs="+", default=[123])
     args = parser.parse_args()
-    for hash_chunks, bit_mask_chunks, path_depth, cache_chunks, direct_depth in product(
-        args.hash_alu_chunks, args.bit_mask_valu_chunks, args.path_reuse_depth, args.depth4_cache_chunks, args.direct_path_depth,
+    for hash_chunks, bit_mask_chunks, path_depth, cache_chunks, direct_depth, backlog, reserve_start in product(
+        args.hash_alu_chunks, args.bit_mask_valu_chunks, args.path_reuse_depth,
+        args.depth4_cache_chunks, args.direct_path_depth, args.alu_vector_backlog,
+        args.alu_vector_reserve_start,
     ):
         kernel.HASH_ALU_CHUNKS = hash_chunks
         kernel.BIT_MASK_VALU_CHUNKS = bit_mask_chunks
         kernel.PATH_REUSE_DEPTH = path_depth
         kernel.DEPTH4_CACHE_CHUNKS = cache_chunks
         kernel.DIRECT_PATH_DEPTH = direct_depth
+        kernel.ALU_VECTOR_BACKLOG = backlog
+        kernel.ALU_VECTOR_RESERVE_START = reserve_start
         start = time.perf_counter()
         builder = kernel.KernelBuilder()
         builder.build_kernel(10, 2047, 256, 16)
@@ -66,6 +72,7 @@ def main():
                               bit_mask_chunks=bit_mask_chunks,
                               path_reuse_depth=path_depth, depth4_cache_chunks=cache_chunks,
                               direct_path_depth=direct_depth,
+                              alu_vector_backlog=backlog, alu_vector_reserve_start=reserve_start,
                               cycles=cycles, scratch=builder.scratch_ptr, policy=builder.schedule_policy,
                               slots=dict(slots), checked_seeds=args.seeds, build_seconds=round(elapsed, 3))), flush=True)
 

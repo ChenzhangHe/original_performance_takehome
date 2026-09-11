@@ -1,5 +1,20 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 26, **1,004 cycles**, scratch
+**1,460**. This session improves 1,037 -> 1,017 -> 1,013 -> 1,004.
+Path-parity reuse, direct interpolation/early lookup and bounded ALU issue
+reservation are accepted; full correctness checks pass. Hash probing found
+no valid shorter expression in its limited templates. Older status below
+is historical; operation-count claims must use the latest baseline.
+
+The bounded scheduling pass is complete. Current work: compute 7,239.875
+vector-equivalents, load 1,940, flow 926. Reaching 900 still necessarily
+requires removing 489.875 compute equivalents, 140 load slots and 26 flow
+slots; these reductions alone do not guarantee the target. Prioritize a
+different state/expression transformation or lower-cost lookup, accounting
+for all setup and conversions. Preserve `hash_fusion_probe.py` as a narrow
+rejection tool, not a proof that the ten-instruction Hash is optimal.
+
 Latest accepted implementation: iteration 25, **1,013 cycles**, scratch
 **1,468**. A is complete; B now uses direct parity interpolation with early
 coefficient selection. It preserves incremental index updates: delaying

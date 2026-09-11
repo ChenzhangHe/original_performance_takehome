@@ -46,10 +46,12 @@ PAIR_LOOKUP_DEPTH = 3
 DEPTH3_COEFF_SELECT = True
 DEPTH4_BIT_SELECT = True
 NODE_VIRTUAL_VECTORS = 5
-DEPTH4_CACHE_CHUNKS = 25
+DEPTH4_CACHE_CHUNKS = 26
 DEPTH4_CACHE_ROUNDS = (4,)
 PATH_REUSE_DEPTH = 4
 DIRECT_PATH_DEPTH = 4
+ALU_VECTOR_BACKLOG = 12
+ALU_VECTOR_RESERVE_START = 60
 
 
 class KernelBuilder:
@@ -253,6 +255,9 @@ class KernelBuilder:
             raise ValueError(policy)
 
         def make_schedule(policy):
+            balanced = policy.startswith("balanced_")
+            if balanced:
+                policy = policy[len("balanced_"):]
             adaptive = policy.startswith("adaptive_")
             if adaptive:
                 policy = policy[len("adaptive_"):]
@@ -304,7 +309,21 @@ class KernelBuilder:
                         )
                     else:
                         candidates.sort(key=priorities.__getitem__, reverse=True)
-                    selected = candidates[: SLOT_LIMITS[engine]]
+                    capacity = SLOT_LIMITS[engine]
+                    # Reserve a whole eight-lane group before scalar issue
+                    # when its ready queue is short. This avoids fragmenting
+                    # ALU capacity into gaps too small for adaptive offload.
+                    if (balanced and engine == "alu"
+                            and len(candidates) <= ALU_VECTOR_BACKLOG
+                            and len(bundles) >= ALU_VECTOR_RESERVE_START):
+                        offload = next((i for i in ready["valu"]
+                                        if ops[i]["slot"][0] not in ("vbroadcast", "multiply_add")), None)
+                        if offload is not None:
+                            ready["valu"].remove(offload)
+                            bundle["alu_vector"] = [ops[offload]["slot"]]
+                            chosen.append(offload)
+                            capacity -= VLEN
+                    selected = candidates[:capacity]
                     del candidates[: len(selected)]
                     if selected:
                         bundle[engine] = [ops[op_id]["slot"] for op_id in selected]
@@ -312,7 +331,8 @@ class KernelBuilder:
 
                 # A binary vector op can issue as eight independent scalar
                 # lanes when the complete group fits this same cycle.
-                if adaptive and SLOT_LIMITS["alu"] - len(bundle.get("alu", ())) >= VLEN:
+                if (adaptive and "alu_vector" not in bundle
+                        and SLOT_LIMITS["alu"] - len(bundle.get("alu", ())) >= VLEN):
                     offload = next((i for i in ready["valu"]
                                     if ops[i]["slot"][0] not in ("vbroadcast", "multiply_add")), None)
                     if offload is not None:
@@ -366,6 +386,9 @@ class KernelBuilder:
             "adaptive_tail_hetero_360_220_220_140_750",
             "adaptive_tail_hetero_480_300_140_220_750",
         )
+        # Keep the existing policies as fallbacks; compare a bounded set of
+        # reservation-aware tail policies on the changed operation graph.
+        policies += tuple("balanced_" + p for p in policies if p.startswith("adaptive_tail_"))
         self.schedule_stats = {}
         best = None
         for policy in dict.fromkeys(policies):

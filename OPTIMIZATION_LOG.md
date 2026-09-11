@@ -1292,3 +1292,39 @@ All are rejected against the 4,238-input deterministic test pool (evaluation
 stops at the first counterexample for each candidate). No survivor or new
 Hash identity is claimed. Any future survivor still requires a full 32-bit
 equivalence proof and the normal kernel acceptance checks.
+
+## Iteration 26 — reserve an ALU vector group before scalar issue
+
+Parent `d0148c2`. Result **1,004 cycles**, scratch **1,460**, down 33 from
+the 1,037-cycle starting point of this work session. After VALU issue, a
+balanced policy can reserve eight ALU slots for one ready binary vector
+operation before issuing scalar work. It does so only when the scalar
+ready queue has at most 12 entries and cycle >=60. The existing policies
+remain fallbacks; add only seven balanced tail-policy candidates. At most
+one vector group is reserved per cycle, with dependencies and register
+lifetimes still tracked as one logical operation until materialization.
+
+At 25 cached chunks, backlog thresholds 4/8/10/11/12/13/14/16/24/32/64
+give 1,013/1,008/1,007/1,007/1,008/1,008/1,009/1,010/1,013/1,012/1,016.
+Threshold 12 with cache coverage 24/25/26/27 gives 1,012/1,008/1,005/1,013.
+Threshold 10/cache 26 gives 1,006. At threshold 12/cache 26, reservation
+start cycles 0/40/60/80 give 1,005/1,005/1,004/1,006. Retain 12/26/60;
+the final policy is `balanced_adaptive_tail_hetero_360_220_140_140_900`.
+Sweep candidates pass frozen seed 123 (the initial threshold sweep also
+passes 456 and 789). Stop this bounded search here.
+
+Final slots: load 1,940; VALU 5,883; ALU 10,855; flow 926; store 32.
+315 vector operations execute on ALU. ALU full-issue cycles rise from 380
+in iteration 25 to 762; this is scheduling improvement, not deleted work.
+Weighted compute is 7,239.875 (+2 from returning to 26 cached chunks).
+First/last gather 64/992, drain 11. Resource floors: load 970, VALU 981,
+ALU 905, flow 926; optimistic combined compute floor 966.
+
+Final official 9/9, built-in 3/3, frozen seeds 1000--1031 and six extra
+shapes x seeds 123/456/789 pass. Extra-shape cycles: 73,152,358,754,592,1616.
+Tests/simulator unchanged. The intermediate 1,005 candidate also passed the
+same acceptance suite. Tuning helper exposes backlog/start parameters.
+Remaining necessary deficits at 900: 489.875 compute equivalents, 140 load
+slots and 26 flow slots, before startup/dependency/drain costs. Next work
+needs a new state/expression transformation or cheaper lookup; do not resume
+an unbounded priority sweep or report the target as achieved.
