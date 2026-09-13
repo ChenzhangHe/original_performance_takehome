@@ -1,5 +1,41 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 34, **969 cycles**, scratch
+**1,475**, parent `1d27efc`. Fuse encoding into the 48 scalar copies that
+already transpose the runtime records. This deletes six setup vector XORs
+without adding copies. It saves **one elapsed cycle**, not six. Exact A/B:
+`--blocked-fuse-setup-xor 0 1` gives **970 / 969** with other defaults.
+
+Slots: load **1,827**, VALU **5,631**, ALU **10,408**, flow **891**, store
+**40**. Weighted compute **6,932**, optimistic compute floor **925**.
+Necessary aggregate deficits at 900 remain **182 compute equivalents and
+27 loads**, with only nine spare flow slots. First/last combined lookup
+load **67/958**, 1,736 lookup loads, drain10; conditional finish bound935.
+There is still no validated complete route to 900.
+
+The larger body-reduction experiments did NOT beat 970:
+
+- Direct left-child landing removes 30 net compute equivalents, but takes
+  981 cycles; allowing verified same-cycle buffer reads/overwrites reaches
+  974, still slower. Applying that scheduler mechanism to the old layout
+  takes 972. Neither the contiguous allocator nor the same-cycle scheduler
+  is in the accepted kernel.
+- Moving records to depths5/6 with a separate depth-4 copy takes 979 with
+  no first cache and seven final cached groups. Eight first cached groups
+  need 1,548 scratch words even without final caching (limit1,536).
+  Do not expand coverage without a new live-storage and readiness plan.
+- Reusing the cache's parent loads saves two more loads but takes 973;
+  lower aggregate work alone remains insufficient.
+
+Next require both lower work and a non-serial load/consumer layout. A
+single contiguous child-landing vector still serializes the eight loads;
+same-cycle WAR handling alone did not solve this. The two body probes and
+their pinned parent are preserved in `experiments/` for reproducibility.
+Hash is unchanged. Full official, frozen, full-word, extra-shape and memory
+acceptance passes; no leaderboard query or submission this iteration.
+
+The implementation status below is historical.
+
 Latest accepted implementation: iteration 33, **970 cycles**, scratch
 **1,475**, parent `fa65372`. This is a structural improvement, not a new
 scheduling-policy sweep. Runtime four-word records hold an encoded depth-4

@@ -61,6 +61,7 @@ def analyze(builder):
         "workspace_words": builder.preencoded_node_count,
         "workspace_layout": builder.workspace_layout,
         "blocked_lookup": builder.blocked_lookup,
+        "blocked_setup_xor_fused": builder.blocked_setup_xor_fused,
         "direct_gather_addresses": builder.direct_gather_addresses,
         "engines": engines,
         "gather": {

@@ -57,11 +57,12 @@ def main():
         "DIRECT_GATHER_ADDRESSES",
         "BLOCKED_LOOKUP", "BLOCKED_READ_BANKS", "BLOCKED_FINAL_CACHE_CHUNKS",
         "BLOCKED_FUSE_PARENT_XOR",
+        "BLOCKED_FUSE_SETUP_XOR",
     ):
         parser.add_argument("--" + name.lower().replace("_", "-"), type=int, nargs="+", default=[getattr(kernel, name)])
     parser.add_argument("--seeds", type=int, nargs="+", default=[123])
     args = parser.parse_args()
-    for hash_chunks, bit_mask_chunks, path_depth, cache_chunks, direct_depth, backlog, reserve_start, final_cache_chunks, address_chain, preencode_depth, input_priority, fragment_issue, direct_addresses, blocked, read_banks, blocked_final_cache, fuse_parent in product(
+    for hash_chunks, bit_mask_chunks, path_depth, cache_chunks, direct_depth, backlog, reserve_start, final_cache_chunks, address_chain, preencode_depth, input_priority, fragment_issue, direct_addresses, blocked, read_banks, blocked_final_cache, fuse_parent, fuse_setup in product(
         args.hash_alu_chunks, args.bit_mask_valu_chunks, args.path_reuse_depth,
         args.depth4_cache_chunks, args.direct_path_depth, args.alu_vector_backlog,
         args.alu_vector_reserve_start,
@@ -72,6 +73,7 @@ def main():
         args.direct_gather_addresses,
         args.blocked_lookup, args.blocked_read_banks, args.blocked_final_cache_chunks,
         args.blocked_fuse_parent_xor,
+        args.blocked_fuse_setup_xor,
     ):
         kernel.HASH_ALU_CHUNKS = hash_chunks
         kernel.BIT_MASK_VALU_CHUNKS = bit_mask_chunks
@@ -90,6 +92,7 @@ def main():
         kernel.BLOCKED_READ_BANKS = read_banks
         kernel.BLOCKED_FINAL_CACHE_CHUNKS = blocked_final_cache
         kernel.BLOCKED_FUSE_PARENT_XOR = bool(fuse_parent)
+        kernel.BLOCKED_FUSE_SETUP_XOR = bool(fuse_setup)
         start = time.perf_counter()
         builder = kernel.KernelBuilder()
         builder.build_kernel(10, 2047, 256, 16)
@@ -114,6 +117,7 @@ def main():
                               blocked_read_banks=read_banks,
                               blocked_final_cache_chunks=blocked_final_cache,
                               blocked_fuse_parent_xor=bool(fuse_parent),
+                              blocked_fuse_setup_xor=builder.blocked_setup_xor_fused,
                               cycles=cycles, scratch=builder.scratch_ptr, policy=builder.schedule_policy,
                               slots=dict(slots), checked_seeds=args.seeds, build_seconds=round(elapsed, 3))), flush=True)
 

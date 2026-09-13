@@ -2007,3 +2007,132 @@ Next target the remaining two child-copy vectors per group, or another
 joint layout/lookup reduction, with full setup and storage accounting.
 Seventy elapsed cycles still separate this implementation from 900. No
 leaderboard lookup, submission, hash shortcut, or test/simulator change.
+
+## Iteration 34 — setup copy fusion; reject serialized child landing
+
+Date: 2026-09-13. Parent `1d27efc`. Accepted **969 cycles**, scratch **1,475**.
+The large body experiments below did not win. The accepted change is a
+small, exact reduction of initialization work; do not present it as a major
+breakthrough toward 900.
+
+### Accepted: perform encoding during the required transpose
+
+The 970 implementation loads six vectors of raw parent/child data, XORs
+each vector with C, then copies the 48 fields into record order with scalar
+add-zero instructions. Every source field is transposed exactly once.
+Change those 48 copies to scalar XOR-C instructions and delete the six
+separate vector XORs. Record contents, padding, workspace boundaries, body
+instructions, and hashing are unchanged. Setup hazard inference provides
+the source-buffer and constant dependencies as before.
+
+The A/B is **970 -> 969**. Accepted slots: load1,827, VALU5,631, ALU10,408,
+flow891, store40. Compared with the parent this is -7 VALU and +8 ALU slots:
+one more surviving binary vector is adaptively offloaded. The stable net
+work saving is **six vector equivalents**, 6,938 -> **6,932**. Scratch and
+load/flow/store counts are unchanged. The optimistic combined compute
+floor falls **926 -> 925**, and necessary 900-cycle deficits become
+**182 compute equivalents, 27 loads**; flow fits by only nine slots.
+
+Selected policy remains `fragment_adaptive_tail_hetero_360_220_140_140_900`.
+There are 359 offloaded vectors, 240 fragmented vectors, maximum span14,
+and 11 pruned constants. Combined lookup traffic is unchanged at1,736
+slots; first/last moves **68/959 -> 67/958**, drain10. At the observed first
+time, the conditional finish bound is935. No new body algorithm or shorter
+hash was accepted this iteration.
+
+### Experiment A: let the left child land directly in scratch
+
+Reorder each runtime record to `[left_child, parent, right_child, padding]`.
+Load lane i into offset i of a contiguous 16-word scratch span. In ascending
+lane order, later vloads preserve the already-written left children. XOR
+the parent directly into the input and copy only the right child. The final
+traversal's addresses need +1 because it reads the parent, not the left
+child. Two new vector bases account for two extra loads and two compute
+equivalents. Net reduction: **32 - 2 = 30 compute equivalents**.
+
+This requires a probe-only allocator supporting atomic, contiguous two-vector
+intervals. Ordinary independent eight-word coloring would be incorrect:
+the unaligned vload writes across the boundary. Protect the whole interval
+through the depth-5 select. Consumers of each old buffer must finish before
+it is overwritten. These dependencies serialize the loads and the default
+prototype takes **981**, despite work falling to6,908.
+
+The simulator reads beginning-of-cycle scratch and commits writes at cycle
+end. A narrower second probe lets old-buffer ALU readers issue in the SAME
+cycle as the next vload. It retains a positive dependency between successive
+overlapping vloads and reserves all required ALU readers before permitting
+an overwrite. Same-cycle edges are remapped during DCE and checked against
+the final schedule; strict RAW dependencies remain unchanged. This improves
+981 -> **974**, not below970. Applying that mechanism to the unchanged old
+four-bank record layout yields **972**, so it is also rejected independently.
+Neither this scheduler nor its allocator is in `perf_takehome.py`.
+
+| Child-landing variant | Final cache | Cycles | Scratch | Weighted compute |
+| --- | ---: | ---: | ---: | ---: |
+| Strict reader-before-overwrite | 6 | 985 | 1,443 | 6,910 |
+| Strict reader-before-overwrite | 7 | 981 | 1,451 | 6,908 |
+| Strict reader-before-overwrite | 8 | 982 | 1,451 | 6,906 |
+| Same-cycle WAR handling | 6 | 977 | 1,475 | 6,910 |
+| Same-cycle WAR handling | 7 | 974 | 1,467 | 6,908 |
+| Same-cycle WAR handling | 8 | 978 | 1,467 | 6,906 |
+| Same-cycle WAR + 8 hash-ALU groups | 7 | 976 | 1,499 | 6,908 |
+| Same-cycle mechanism, original layout, 2 buffers | 7 | 975 | 1,483 | 6,938 |
+| Same-cycle mechanism, original layout, 4 buffers | 7 | 972 | 1,443 | 6,938 |
+
+These valid prototypes check three frozen seeds and exact primitive emission.
+They do not have the production version's full acceptance claim. Their code
+is preserved in `experiments/iteration34_child_landing.py`, pinned to970.
+
+### Experiment B: move the record pair deeper
+
+Prepare 32 parent/children records for depths5/6 in128 workspace words,
+plus a separate16-word encoded depth-4 copy. This frees deeper gather work,
+but uses14 setup vloads,18 stores, larger pointer/bias setup and additional
+live cached values. Address transitions into records and back to depth7
+are explicit. No runtime data is precomputed by Python.
+
+| First/final depth-4 cache groups | Result |
+| --- | --- |
+| 0 / 0 | 998 cycles, scratch1,334; load1,901, weighted compute6,920.125, flow800 |
+| 0 / 7 | 979 cycles, scratch1,452; load1,847, weighted compute6,925.125, flow891 |
+| 8 / 0 | Rejected: requires1,548 scratch words, limit1,536 |
+| 8 / 7 | Rejected: requires1,652 scratch words, limit1,536 |
+
+The two feasible versions pass three frozen seeds and primitive-emission
+checks. Overflow cases have NO valid performance result; the scratch limit
+was not increased. See `experiments/iteration34_deeper_block.py`.
+
+### Other bounded setup probes
+
+- Fuse the raw-root copy with encoding too: weighted work6,931.875, but
+  **970 cycles**, so keep the old root setup.
+- Share depth-4 cache loads with record preparation: populate parents in
+  eight persistent record buffers before transforming cache coefficients,
+  then fill children and store. Saves two extra load slots with unchanged
+  work6,932, but takes **973**, scratch1,467. Not accepted.
+- Accepted setup fusion with six/seven/eight final cached groups gives
+  **973 / 969 / 974**; keep seven.
+
+### Acceptance and reproduction
+
+Official **9/9**, built-in **3/3**, frozen seeds1000--1031, eight full-word
+fixtures, primitive-emission reconstruction, exact records/padding and
+memory boundaries pass. The six extra shapes and three alternate path-depth
+configurations each pass seeds123/456/789 at their unchanged cycle counts.
+The new setup flag applies only when blocked lookup is active; fallback
+paths and official tests/simulator are unchanged.
+
+```sh
+python3 tune_kernel.py --blocked-fuse-setup-xor 0 1 --seeds 123 456 789
+python3 tests/submission_tests.py
+python3 perf_takehome.py
+python3 verify_kernel.py --extra-shapes
+python3 experiments/iteration34_child_landing.py --zero-war
+python3 experiments/iteration34_deeper_block.py --first-cache 0 --final-cache 7
+```
+
+Next require a non-serial child-consumer layout or another transformation
+that reduces BOTH work and the live/readiness cost. Repeating the same
+direct-child or larger-depth cache variants is not a justified plan. There
+are still69 elapsed cycles to900; this iteration establishes no complete
+route. No leaderboard lookup or external benchmark submission was performed.

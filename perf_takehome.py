@@ -62,6 +62,7 @@ BLOCKED_LOOKUP = True
 BLOCKED_READ_BANKS = 4
 BLOCKED_FINAL_CACHE_CHUNKS = 7
 BLOCKED_FUSE_PARENT_XOR = True
+BLOCKED_FUSE_SETUP_XOR = True
 
 
 class KernelBuilder:
@@ -516,6 +517,7 @@ class KernelBuilder:
         blocked_lookup = (scored_shape and BLOCKED_LOOKUP
                           and DIRECT_GATHER_ADDRESSES and DIRECT_PATH_DEPTH >= 4)
         self.blocked_lookup = blocked_lookup
+        self.blocked_setup_xor_fused = blocked_lookup and BLOCKED_FUSE_SETUP_XOR
         assert BLOCKED_READ_BANKS in (1, 2, 4, 8)
         assert not blocked_lookup or 0 <= BLOCKED_FINAL_CACHE_CHUNKS <= chunk_count
         self.fragment_alu_enabled = scored_shape and ALU_FRAGMENT_ISSUE
@@ -785,14 +787,20 @@ class KernelBuilder:
                 for dest, address in zip(block_input, addresses):
                     addr = self.scratch_const(address)
                     self.add("load", ("vload", dest, addr))
-                    self.add("valu", ("^", dest, dest, final_xor_vec))
+                    if not BLOCKED_FUSE_SETUP_XOR:
+                        self.add("valu", ("^", dest, dest, final_xor_vec))
                 for pair in range(4):
                     for member in range(2):
                         parent = pair*2 + member
                         children = [block_input[1 + (2*parent+j)//VLEN] + (2*parent+j)%VLEN
                                     for j in (0, 1)]
                         for j, scalar in enumerate([block_input[0]+parent, *children]):
-                            self.add("alu", ("+", block_output + 4*member+j, scalar, readonly_zero))
+                            # Each source field is transposed exactly once.
+                            # Encode during that existing scalar copy instead
+                            # of first XORing all six input vectors separately.
+                            opcode, operand = (("^", final_xor_const) if BLOCKED_FUSE_SETUP_XOR
+                                               else ("+", readonly_zero))
+                            self.add("alu", (opcode, block_output + 4*member+j, scalar, operand))
                     self.add("store", ("vstore", block_store_addr, block_output))
                     if parent_start != 8 or pair != 3:
                         self.add("alu", ("+", block_store_addr, block_store_addr, address_step))
