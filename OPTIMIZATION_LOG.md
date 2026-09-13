@@ -1583,3 +1583,126 @@ remain unchanged. Necessary 900-cycle deficits now are 403.125 compute
 equivalents, 123 loads, and 39 flow operations. The load deficit is WORSE
 than the parent despite the arithmetic reduction. No leaderboard upload or
 new leaderboard research was performed during this iteration.
+
+## Iteration 31 — consumer-aware input readiness and fragmented scalar issue
+
+Date: 2026-09-13. Parent `0c89047`. Accepted **988 cycles**, scratch
+**1,440**, down six cycles (about 0.60%). Official tests and `problem.py`
+are unchanged. Neither accepted change deletes arithmetic or memory work.
+
+### Two independent limitations, measured together
+
+1. Input-address initialization retained the dummy scheduling cohort -1,
+   although each anchor feeds a specific group's root-round load. Attribute
+   the address to that group and round 0. All data and hazard dependencies
+   remain intact. Root inputs can overlap setup sooner: the first gather
+   moves from cycle **61 to 55**. This change alone gives **990** cycles.
+   Attributing the same addresses to round -1 instead gives 992.
+2. Adaptive ALU offload previously needed eight free scalar slots in ONE
+   cycle. Add a bounded family of fragment-enabled versions of the existing
+   tail policies. Issue as many lanes as fit, keep at most one unfinished
+   vector, and release its logical consumers only after the final lane.
+   A partial vector does not preempt ready scalar instructions. Original
+   whole-vector policies remain fallbacks. Fragments alone give **993**;
+   combined with the round-0 input metadata they give **988**. Round--1
+   input metadata plus fragments gives 991.
+
+Both switches apply only to the scored (height,batch,rounds)=(10,256,16)
+shape. Other shapes retain their prior candidate family and input metadata.
+
+| Input consumer priority | Fragment issue | Cycles | Scratch |
+| --- | --- | ---: | ---: |
+| Off | Off | 994 | 1,432 |
+| Off | On | 993 | 1,440 |
+| On | Off | 990 | 1,408 |
+| On | On | **988** | **1,440** |
+
+Accepted policy: `fragment_adaptive_tail_hetero_360_220_140_140_900`.
+Slots: load **1,923**, VALU **5,842**, ALU **10,489**, flow **939**, store
+**46**. Relative to the parent, 22 additional vector operations move to ALU
+(VALU -22, ALU +176). Total offloaded vector operations **368**, of which
+**224** span multiple cycles. The longest spans **27 cycles**; treating it
+as a single final-cycle register use would be incorrect. Allocation now
+protects every logical vector from first touch through final completion.
+
+The builder verifies that every offloaded lane issues exactly once, that
+consumers begin strictly after their producers finish, and that all final
+bundles satisfy engine capacities. `analyze_kernel.py` now uses actual
+per-lane issue times for ALU counts, waits and per-round timelines, rather
+than attributing all eight lanes to the vector's last issue cycle.
+
+Weighted compute remains **7,153.125**; its optimistic floor remains 954.
+Per-engine floors: load **962**, VALU **974**, ALU **875**, flow **939**.
+First/last gather **55/977**, drain **10**, gather slots **1,832**. At 900,
+the necessary deficits still are **403.125 compute equivalents, 123 loads,
+39 flow operations**, before startup/dependencies. This win reduces exposed
+startup and improves placement; it is not a new route around those budgets.
+
+### Bounded rejected experiments
+
+These probes preceded the final input-priority combination unless stated
+otherwise. Lookup-balance probes used seed 123; the remaining groups used
+123/456/789. A scratch overflow is a rejection, not a speed result.
+
+| Experiment | Configurations | Cycles |
+| --- | --- | --- |
+| Replace depth-2 pair selection with two MACs and one select | Lowest 8 / 16 / 32 groups, first cache 26 | 994 / 995 / 1,000 |
+| Analogous depth-3 two-MAC form | Lowest 8 / 16 / 32 groups | 999 / 996 / scratch overflow |
+| Extra first cache with arithmetic lookup | d2=16, cache27 / d3=16, cache27 / d3=32, cache28 / d2=d3=16, cache28 | 996 / 997 / overflow / 1,002 |
+| Remove redundant direct-lookup index barrier | Default cache | 994 |
+| Direct positive addresses plus preencoding | Depth6, first cache 26 / 25 / 27 | 995 / 999 / 998 |
+| Same direct addresses, other copied ranges | Depth5 / depth7, cache26 | 995 / 1,001 |
+| Reuse depth-4 cache loads for workspace copy | Scalar setup encoding, depths6 / 5 / 7 | 996 / 997 / 998 |
+| Same shared copy, vector setup encoding | Depth6 / 5 | 996 / 996 |
+| Require at least four free lanes to start a fragment | Do not preempt / finish partial first | 995 / 996 |
+| Always complete a partial before scalar issue | One-lane minimum | 995 |
+| Allocate fragment lanes before VALU selection | Always / only VALU queue >6 | 1,002 / 1,004 |
+| Same early allocation, cache27 | VALU queue >6 | 1,008 |
+| Fragments with more first-round caching | Cache27 / 28 | 1,000 / 1,011 |
+| Fragments plus direct addresses/preencoding | Cache26 / 27 / 28 | 996 / 999 / 1,009 |
+| Fragments plus shared cache/workspace copies | Cache26 / 27 | 993 / 1,000 |
+| Fragments plus d2 arithmetic on 8 groups | Cache27 | 995 |
+| Shift equal gather savings to final traversal | First/final cache 25/2, 24/3, 23/4 | 1,005 / 1,022 / 1,017 |
+| Fragments with one extra final cached group | First/final 26/2 | 997 |
+
+Direct addresses lower compute to 7,098.125 at depth6/cache26, but add six
+loads and move the first gather to 64: they still lose. Sharing depth-4
+setup loads removes two loads and 2.25 compute equivalents, but extends
+setup dependencies and does not improve elapsed time. Arithmetic lookup
+frees flow at the cost of compute and sometimes excessive live storage.
+Aggressive pre-VALU fragment allocation offloads 530 vectors, but raises
+ALU demand to 11,785 slots and loses at 1,002 cycles. These are concrete
+counterexamples to optimizing only aggregate counts or offload volume.
+
+### Acceptance and reproduction
+
+Official **9/9**, built-in **3/3**, frozen seeds **1000--1031**, six extra
+shapes x **123/456/789**, and alternative (PATH,DIRECT)=(0,0)/(2,2)/(3,3)
+x three seeds pass. Extra-shape cycles stay **72,150,350,751,590,1614**;
+alternate modes give **1,011/1,002/994**. They are compatibility checks.
+Preencoding depths 0/4/5/7 also pass three seeds with both new switches
+enabled, at **995/989/988/994**. Depth 5 ties the default's elapsed cycles
+with eight fewer loads but 22 more compute equivalents; retain depth 6
+because neither setting dominates both budgets.
+
+Add permanent local `verify_kernel.py`: reconstruct every emitted primitive
+slot from the scheduled DAG and actual lane times, compare exact multisets
+after register renaming, check producer/consumer timing and capacities, run
+32 reference seeds, and check eight full-32-bit fixtures (four bit patterns,
+four random seeds). Fixtures verify output values, exact workspace contents,
+and unchanged header/forest/index tail. This is separate from official tests.
+
+```sh
+python3 tune_kernel.py --input-address-consumer-priority 0 1 --alu-fragment-issue 0 1 --seeds 123 456 789
+python3 tests/submission_tests.py
+python3 perf_takehome.py
+python3 verify_kernel.py
+python3 analyze_kernel.py
+```
+
+The first command reproduces the full 994/993/990/988 causal matrix. With
+both switches off, `NODE_PREENCODE_DEPTH=0` still restores the earlier
+995-cycle graph. Do not interpret disabling preencoding alone, while these
+new switches remain enabled, as an exact historical-baseline reproduction.
+No leaderboard research, submission, simulator change, or runtime input
+precomputation was performed in this iteration.

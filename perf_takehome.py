@@ -55,6 +55,8 @@ ALU_VECTOR_BACKLOG = 12
 ALU_VECTOR_RESERVE_START = 60
 INPUT_ADDRESS_CHAIN_LENGTH = 2
 NODE_PREENCODE_DEPTH = 6  # Zero disables runtime preprocessing.
+INPUT_ADDRESS_CONSUMER_PRIORITY = True
+ALU_FRAGMENT_ISSUE = True
 
 
 class KernelBuilder:
@@ -258,6 +260,9 @@ class KernelBuilder:
             raise ValueError(policy)
 
         def make_schedule(policy):
+            fragmented = policy.startswith("fragment_")
+            if fragmented:
+                policy = policy[len("fragment_"):]
             balanced = policy.startswith("balanced_")
             if balanced:
                 policy = policy[len("balanced_"):]
@@ -271,6 +276,7 @@ class KernelBuilder:
                 if count == 0:
                     ready[ops[op_id]["engine"]].append(op_id)
 
+            partial = None  # (logical operation ID, first unissued lane)
             scheduled_count = 0
             bundles = []
             engine_order = ("load", "valu", "alu", "store", "flow")
@@ -332,9 +338,35 @@ class KernelBuilder:
                         bundle[engine] = [ops[op_id]["slot"] for op_id in selected]
                         chosen.extend(selected)
 
-                # A binary vector op can issue as eight independent scalar
-                # lanes when the complete group fits this same cycle.
-                if (adaptive and "alu_vector" not in bundle
+                # Binary vectors can use scalar ALU lanes. Original policies
+                # issue all eight together; fragments may use smaller gaps.
+                if fragmented:
+                    # Use any leftover scalar slots, including gaps smaller
+                    # than a vector. A started vector leaves the ready queue;
+                    # none of its consumers unlock until all lanes have issued.
+                    capacity = (SLOT_LIMITS["alu"] - len(bundle.get("alu", ()))
+                                - VLEN * len(bundle.get("alu_vector", ())))
+                    while capacity:
+                        if partial is not None:
+                            op_id, lane = partial
+                            partial = None
+                        else:
+                            op_id = next((i for i in ready["valu"]
+                                          if ops[i]["slot"][0] not in
+                                          ("vbroadcast", "multiply_add")), None)
+                            if op_id is None:
+                                break
+                            ready["valu"].remove(op_id)
+                            lane = 0
+                        end = min(VLEN, lane + capacity)
+                        # Keep logical addresses until lifetime allocation.
+                        bundle.setdefault(f"alu_fragment_{lane}_{end}", []).append(ops[op_id]["slot"])
+                        capacity -= end - lane
+                        if end == VLEN:
+                            chosen.append(op_id)
+                        else:
+                            partial = (op_id, end)
+                elif (adaptive and "alu_vector" not in bundle
                         and SLOT_LIMITS["alu"] - len(bundle.get("alu", ())) >= VLEN):
                     offload = next((i for i in ready["valu"]
                                     if ops[i]["slot"][0] not in ("vbroadcast", "multiply_add")), None)
@@ -344,7 +376,7 @@ class KernelBuilder:
                         bundle["alu_vector"] = [ops[offload]["slot"]]
                         chosen.append(offload)
 
-                assert chosen, "Dependency cycle in scheduler"
+                assert bundle, "Dependency cycle in scheduler"
                 bundles.append(bundle)
                 scheduled_count += len(chosen)
                 for op_id in chosen:
@@ -392,6 +424,11 @@ class KernelBuilder:
         # Keep the existing policies as fallbacks; compare a bounded set of
         # reservation-aware tail policies on the changed operation graph.
         policies += tuple("balanced_" + p for p in policies if p.startswith("adaptive_tail_"))
+        if getattr(self, "fragment_alu_enabled", False):
+            # Compare only the existing tail priorities with this new issue
+            # mechanism. All original whole-vector policies remain fallbacks.
+            policies += tuple("fragment_" + p for p in policies
+                              if p.startswith(("adaptive_tail_", "balanced_adaptive_tail_")))
         self.schedule_stats = {}
         best = None
         for policy in dict.fromkeys(policies):
@@ -403,8 +440,26 @@ class KernelBuilder:
         identities = {id(op["slot"]): i for i, op in enumerate(ops)}
         self.issue_cycles = {identities[id(slot)]: cycle for cycle, bundle in enumerate(best)
                              for slots in bundle.values() for slot in slots}
-        self.offloaded_ops = {identities[id(slot)] for bundle in best
-                              for slot in bundle.get("alu_vector", ())}
+        self.issue_first_cycles = {}
+        self.lane_issue_cycles = {}
+        for cycle, bundle in enumerate(best):
+            for engine, slots in bundle.items():
+                for slot in slots:
+                    op_id = identities[id(slot)]
+                    self.issue_first_cycles.setdefault(op_id, cycle)
+                    if engine == "alu_vector" or engine.startswith("alu_fragment_"):
+                        first, last = ((0, VLEN) if engine == "alu_vector"
+                                       else map(int, engine.split("_")[-2:]))
+                        lanes = self.lane_issue_cycles.setdefault(op_id, [None] * VLEN)
+                        for lane in range(first, last):
+                            assert lanes[lane] is None, "Lane issued twice"
+                            lanes[lane] = cycle
+        for op_id, lanes in self.lane_issue_cycles.items():
+            assert all(cycle is not None for cycle in lanes), "Unissued vector lane"
+        for op_id, op in enumerate(ops):
+            assert all(self.issue_first_cycles[op_id] > self.issue_cycles[dep]
+                       for dep in op["deps"]), "Consumer issued before producer completed"
+        self.offloaded_ops = set(self.lane_issue_cycles)
         self.instrs.extend(best)
 
     def alloc_scratch(self, name=None, length=1):
@@ -452,9 +507,11 @@ class KernelBuilder:
             "Negative indices require the pair-coefficient low-bit lookup path"
         )
         chunk_count = batch_size // VLEN
+        scored_shape = (forest_height, batch_size, rounds) == (10, 256, 16)
+        self.fragment_alu_enabled = scored_shape and ALU_FRAGMENT_ISSUE
         # Cache coverage is tuned for the scored shape; retain the generic path
         # elsewhere, where different overlap can require more live scratch.
-        cache_depth4 = (forest_height, batch_size, rounds) == (10, 256, 16) and (DEPTH4_CACHE_CHUNKS > 0 or DEPTH4_FINAL_CACHE_CHUNKS > 0) and any(
+        cache_depth4 = scored_shape and (DEPTH4_CACHE_CHUNKS > 0 or DEPTH4_FINAL_CACHE_CHUNKS > 0) and any(
             r < rounds and r % (forest_height + 1) == 4 for r in DEPTH4_CACHE_ROUNDS
         )
         def depth4_cached(round_no, chunk_no):
@@ -468,7 +525,7 @@ class KernelBuilder:
         # The scored contract requires final values, not final indices. Use
         # part of the otherwise-unused index array as runtime workspace; the
         # forest and input values are never overwritten by preprocessing.
-        preencode = (forest_height, batch_size, rounds) == (10, 256, 16) and NODE_PREENCODE_DEPTH > 0
+        preencode = scored_shape and NODE_PREENCODE_DEPTH > 0
         encode_first = 4
         encode_last = NODE_PREENCODE_DEPTH
         encode_node_first = (1 << encode_first) - 1
@@ -730,6 +787,10 @@ class KernelBuilder:
         # while replacing half of these load slots with scalar additions.
         input_addr_ready = []
         for chunk_no in range(chunk_count):
+            if scored_shape and INPUT_ADDRESS_CONSUMER_PRIORITY:
+                # This address feeds the group's root-round input load. Do
+                # not strand every anchor behind setup as a dummy cohort -1.
+                emit_context.update(chunk=chunk_no, round=0, local_seq=0)
             if chunk_no % INPUT_ADDRESS_CHAIN_LENGTH == 0:
                 ready = emit("load", ("const", input_addrs + chunk_no,
                                       inp_values_p + chunk_no * VLEN))
@@ -1269,10 +1330,17 @@ class KernelBuilder:
                                      tuple(depth4_vectors if cache_depth4 else ()) + tuple(encode_buffers) +
                                      tuple(range(idx, idx + batch_size, VLEN)))
         for bundle in self.instrs:
-            for op, dest, left, right in bundle.pop("alu_vector", ()):
-                bundle.setdefault("alu", []).extend(
-                    (op, dest + lane, left + lane, right + lane) for lane in range(VLEN)
-                )
+            for engine in list(bundle):
+                if engine != "alu_vector" and not engine.startswith("alu_fragment_"):
+                    continue
+                first, last = ((0, VLEN) if engine == "alu_vector"
+                               else map(int, engine.split("_")[-2:]))
+                for op, dest, left, right in bundle.pop(engine):
+                    bundle.setdefault("alu", []).extend(
+                        (op, dest + lane, left + lane, right + lane)
+                        for lane in range(first, last)
+                    )
+            assert all(len(slots) <= SLOT_LIMITS[engine] for engine, slots in bundle.items())
 
     def prioritize_setup_by_first_use(self, ops, setup_end):
         """Delay setup priority to its first consuming round, without new deps.
@@ -1326,6 +1394,11 @@ class KernelBuilder:
         """Color node vectors after scheduling, preserving every issue cycle."""
         times = {id(slot): cycle for cycle, bundle in enumerate(self.instrs)
                  for slots in bundle.values() for slot in slots}
+        first_times = {}
+        for cycle, bundle in enumerate(self.instrs):
+            for slots in bundle.values():
+                for slot in slots:
+                    first_times.setdefault(id(slot), cycle)
         intervals = []
         for base, start, end, width in uses:
             for address in (base + n * VLEN for n in range(width)):
@@ -1336,7 +1409,9 @@ class KernelBuilder:
                     if addresses & (reads | writes):
                         touched.append(op)
                 if touched:
-                    intervals.append((min(times[id(o["slot"])] for o in touched),
+                    # A fragmented vector may first touch its registers well
+                    # before its final lane completes. Protect that full span.
+                    intervals.append((min(first_times[id(o["slot"])] for o in touched),
                                       max(times[id(o["slot"])] for o in touched),
                                       address, start, end))
         # A cache coefficient's physical vector can host nodes after its last

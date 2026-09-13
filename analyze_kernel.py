@@ -5,7 +5,7 @@ import json
 from math import ceil
 
 from perf_takehome import KernelBuilder
-from problem import SLOT_LIMITS, VLEN
+from problem import SLOT_LIMITS
 
 
 class AnalyzedKernel(KernelBuilder):
@@ -17,6 +17,7 @@ class AnalyzedKernel(KernelBuilder):
 def analyze(builder):
     operations = builder.operations
     issued = builder.issue_cycles
+    first_issued = builder.issue_first_cycles
     assert len(issued) == len(operations)
     by_round = defaultdict(lambda: defaultdict(list))
     waits = defaultdict(list)
@@ -24,12 +25,12 @@ def analyze(builder):
     gathers = []
     for i, op in enumerate(operations):
         ready = max((issued[d] + 1 for d in op["deps"]), default=0)
-        assert issued[i] >= ready, (i, ready, issued[i])
+        assert first_issued[i] >= ready, (i, ready, first_issued[i])
         engine = "alu" if i in builder.offloaded_ops else op["engine"]
-        weight = VLEN if i in builder.offloaded_ops else 1
-        counts[engine] += weight
-        waits[engine].extend([issued[i] - ready] * weight)
-        by_round[op["round"]][engine].extend([issued[i]] * weight)
+        lane_times = builder.lane_issue_cycles.get(i, [issued[i]])
+        counts[engine] += len(lane_times)
+        waits[engine].extend(t - ready for t in lane_times)
+        by_round[op["round"]][engine].extend(lane_times)
         if engine == "load" and op["slot"][0] == "load_offset":
             gathers.append(issued[i])
     engines = {}
@@ -49,6 +50,8 @@ def analyze(builder):
         "scratch": builder.scratch_ptr,
         "policy": builder.schedule_policy,
         "offloaded_vector_ops": len(builder.offloaded_ops),
+        "fragmented_vector_ops": sum(len(set(ts)) > 1 for ts in builder.lane_issue_cycles.values()),
+        "max_fragment_span": max((max(ts) - min(ts) + 1 for ts in builder.lane_issue_cycles.values()), default=0),
         "pruned_constant_loads": builder.pruned_constant_loads,
         "preencoded_nodes": builder.preencoded_node_count,
         "engines": engines,

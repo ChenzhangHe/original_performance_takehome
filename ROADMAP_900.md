@@ -1,5 +1,35 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 31, **988 cycles**, scratch
+**1,440**, parent `0c89047`. This is a six-cycle improvement, not an
+operation-count reduction. Input-address anchors now carry their consuming
+group's round-0 scheduling metadata. This moves the first gather from 61
+to 55 and alone reaches 990. Lane-fragment ALU issue uses gaps smaller than
+eight slots and brings the combination to 988. All old whole-vector
+policies remain candidates; fragmented consumers wait for ALL lanes, and
+register lifetimes span first issue through last completion.
+
+The causal A/B is **994 / 993 / 990 / 988** for neither change / fragments
+only / input priority only / both. Slots: load **1,923**, VALU **5,842**,
+ALU **10,489**, flow **939**, store **46**. Weighted compute stays
+**7,153.125**, with the same optimistic floor **954**. Necessary deficits
+at 900 remain **403.125 compute equivalents, 123 loads, 39 flow**. First/last
+gather is **55/977**, drain 10; 88 elapsed cycles remain to reach 900.
+
+Next: separate startup latency from steady-state work. The old input
+anchors' dummy group metadata delayed useful loads; deleting more operations
+did not fix that. Conversely, better slot filling has NOT solved the body
+budget. Larger caches, arithmetic-for-select tradeoffs, direct addresses,
+and preencoding load reuse were tested again in bounded combinations and
+did not beat this result. Before adding more issue rules, require a measured
+reduction in the load/compute/flow deficit, including setup. Use the new
+`verify_kernel.py` to check exact emitted slots, cross-cycle dependencies,
+32 frozen-reference seeds, and eight full-32-bit memory-boundary fixtures.
+Both changes can be disabled with their named switches in `tune_kernel.py`.
+No leaderboard recheck or submission was performed in this iteration.
+
+The implementation status below is historical.
+
 Latest accepted implementation: iteration 30, **994 cycles**, scratch
 **1,432**, parent `95ca48d`. Runtime preprocessing encodes the 112 tree
 nodes at depths 4--6 into the first 112 words of the unused input-index
