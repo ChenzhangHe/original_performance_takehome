@@ -1,5 +1,60 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 33, **970 cycles**, scratch
+**1,475**, parent `fa65372`. This is a structural improvement, not a new
+scheduling-policy sweep. Runtime four-word records hold an encoded depth-4
+parent and both depth-5 children. Four independent read buffers per group
+prefetch both levels; a retained parity selects the child without another
+gather. Fuse the parent's buffer copy with its input XOR. Use the freed flow
+budget to replace depth-2/3 interpolation MACs with early-bit-first pure
+selection, and cache the final depth-4 lookup for the highest seven groups.
+
+Slots: load **1,827**, VALU **5,638**, ALU **10,400**, flow **891**, store
+**40**. Weighted compute **6,938**, optimistic combined compute floor **926**.
+Versus 987: **-17 cycles, -184.5 compute equivalents, -86 loads, -48 flow**,
+with two more stores and two more scratch words. The workspace holds 48
+encoded nodes plus 16 zero padding words; the remaining 192 index words,
+forest and header remain unchanged. There is no input-dependent Python
+precomputation. Generic shapes and alternate direct-path depths use the old
+implementation.
+
+At 900, necessary aggregate deficits are now **188 compute equivalents**
+and **27 loads**. Flow fits by just nine slots, before timing constraints;
+it is not an unlimited resource. The ten-instruction hash is unchanged.
+This is progress toward 900, not a demonstrated complete route to it.
+
+Important diagnostic correction: `load_offset` alone no longer counts all
+node lookup traffic. The accepted schedule has **256 record vloads + 1,480
+scalar gathers = 1,736 lookup loads**, first/last **68/959**, drain **10**.
+At that fixed first-lookup time, their conditional finish bound is **936**.
+Even the remaining 27-load aggregate reduction would not alone ensure 900;
+startup and body readiness must also improve. `analyze_kernel.py` reports
+both the narrow gather metric and the combined lookup-load metric.
+
+Next, in order:
+
+1. Reduce the two child-copy vectors per blocked group (64 compute
+   equivalents total), or fuse their consumption, without restoring scalar
+   selection congestion or serializing vloads. The parent-copy/XOR fusion
+   already saves 32 equivalents and must not be counted again.
+2. Co-design another record/lookup reduction against the remaining compute
+   and load deficits. Budget runtime rearrangement, padding, scratch and
+   addresses first; do not assume wider records are automatically cheaper.
+3. Address the 68-cycle first-lookup startup only on that cheaper graph.
+   The first serial-buffer prototype took 1,000--1,016 despite fewer
+   instructions; parallel readiness and high-group final caches were needed
+   to turn the reduced work into a real gain.
+
+Reproduce **987 / 977 / 970** with blocked lookup disabled / enabled without
+parent-XOR fusion / enabled with fusion, respectively. Controls are
+`--blocked-lookup`, `--blocked-read-banks`, `--blocked-final-cache-chunks`,
+and `--blocked-fuse-parent-xor`. The older preencoding and depth-4 cache
+controls govern only the fallback while blocked lookup is enabled.
+Use `python3 verify_kernel.py --extra-shapes` for the durable full local
+acceptance suite. No leaderboard query or submission this iteration.
+
+The implementation status below is historical.
+
 Latest accepted implementation: iteration 32, **987 cycles**, scratch
 **1,473**, parent `3f2f4e2`. Direct gather addresses finally win when their
 constants are derived from shared scalars and the copied range is reduced

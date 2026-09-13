@@ -1846,3 +1846,164 @@ The explicit parent reproduction is `--direct-gather-addresses 0
 submission was performed. The next target remains structural body reduction
 with setup, flow and live-storage costs included, not another unconstrained
 priority sweep.
+
+## Iteration 33 — parent/children records and copy-consumer fusion
+
+Date: 2026-09-13. Parent `fa65372`. Accepted **970 cycles**, scratch
+**1,475 / 1,536**, versus 987 / 1,473. Intermediate verified checkpoints:
+**979 -> 978 -> 977 -> 970**. No changes to the simulator or official tests.
+
+### Insight: spend one load on useful work in two rounds
+
+The previous depth-4 cache removed loads at the price of four MACs and
+eleven selects per cached group. Instead, preprocess the 16 depth-4 parents
+and 32 depth-5 children into runtime records:
+
+`[parent ^ C, left_child ^ C, right_child ^ C, 0]`, C=`0xB55A4F09`.
+
+Two records fit in one eight-word vstore. Preparation uses six vloads and
+six vector XORs, 48 scalar field copies, eight stores, and explicit address
+setup/update operations. ALL their emitted costs are included in the result.
+The 64-word record array occupies only the unused input-index workspace.
+Nothing is computed from runtime tree/input values in the Python builder.
+
+Each item does one vload at its parent record. Only the first three words
+are consumed; the final record's eight-word read extends into untouched
+index workspace but never into input values. Four independent virtual read
+buffers per vector group prevent the eight loads from forming a single
+load-copy-load chain. Each bank's next write waits for all three consumers
+of its old contents. Children remain live across the parent hash, and its
+retained parity selects the next node with one vselect and NO depth-5 load.
+Read-buffer and child-vector lifetimes are colored by actual issue times.
+
+The first version copied all three fields, then XORed the parent vector
+into the input. Fuse the parent copy with that XOR: each parent buffer word
+is XORed directly into its input lane. Hash consumers wait for all lanes
+and all pending buffer reads. This deletes one vector operation per group,
+**32 compute equivalents**, and improves **977 -> 970** at identical
+load/flow/store counts. Two child copies per item remain; do not describe
+the implementation as transpose-free.
+
+### Address and lookup co-design
+
+Let A4 be the ordinary forest address, W the index workspace base and p4/p5
+the encoded parities. A record address is `B=4*A4+W-88`. The depth-6 forest
+address is `A6=B+(73-W)-2*p4-p5`. Construct B from weighted earlier path bits;
+prepare its exit bias after its loads read the address; incorporate p4 by
+MAC and p5 by subtraction. This avoids a full independent depth-5 address.
+All arithmetic is modulo 2^32. The child record slot is left when p4=1 and
+right when p4=0, because the encoded hash parity inverts the raw parity.
+
+Removing the first traversal's large depth-4 cache frees flow capacity.
+Spend part of it to replace the depth-2/3 interpolation MACs with pure
+selection: **128 body MACs disappear**, at **128 extra selects**, plus six
+scalar pair-difference operations disappear from setup. Order each select
+tree by the EARLIEST available path bit first; only its last select waits
+for the newest bit. Keeping the opposite order increases the critical path.
+
+Finally cache depth 4 for the **highest seven groups (25--31)** in round 15.
+Their earlier cohort progress permits coefficient selection to overlap
+remaining deep gathers. Applying this cache to the lowest groups created
+a long tail and lost badly. The highest-group experiment that failed on the
+987 graph is not a contradiction: the record layout and pure selects have
+changed both the operation and flow budgets.
+
+### Full accounting and bounds
+
+| Metric | Parent | Accepted | Delta |
+| --- | ---: | ---: | ---: |
+| Cycles | 987 | 970 | -17 |
+| Weighted compute (VALU + ALU/8) | 7,122.5 | 6,938 | -184.5 |
+| Load slots | 1,913 | 1,827 | -86 |
+| VALU slots | 5,814 | 5,638 | -176 |
+| ALU slots | 10,468 | 10,400 | -68 |
+| Flow slots | 939 | 891 | -48 |
+| Store slots | 38 | 40 | +2 |
+| Scratch words | 1,473 | 1,475 | +2 |
+
+The individual ALU/VALU counts include adaptive offloading; their weighted
+sum is the stable compute comparison. Combined compute floor falls
+**950 -> 926**. Accepted per-engine floors: load 914, VALU 940, ALU 867,
+flow 891. Necessary aggregate reductions for 900 are still **188 compute
+equivalents and 27 loads**. Flow has only nine slots of aggregate margin.
+The ten-operation hash is unchanged; no shorter identity was found or used.
+
+The new schedule has 256 record vloads and 1,480 scalar gathers: **1,736
+lookup-load slots**, first/last **68/959**, drain 10. A scalar-gather-only
+report would misleadingly show first=95 and omit all 256 record loads.
+`analyze_kernel.py` now reports the combined metric separately. Its
+fixed-first-time conditional finish bound is 936, so removing only the
+27 aggregate excess loads is not a sufficient plan for 900.
+
+Chosen EXISTING policy: `fragment_adaptive_tail_hetero_360_220_140_140_900`.
+There are 358 offloaded vectors, 240 fragmented vectors, max span 14, and
+11 pruned constants. Reclaim new address constants after their last use;
+at the pre-fusion 977 checkpoint this lowered scratch 1,491 -> 1,483
+without changing cycles. No new scheduler priority family was introduced.
+
+### Bounded experiments and rejected alternatives
+
+Every measured candidate below passed frozen seeds 123/456/789. Early
+prototypes were isolated from the accepted implementation; they are not
+claimed as speedups. Constants and scratch coloring differ between rows
+where explicitly noted, so use the final CLI matrix for exact reproduction.
+
+| Experiment | Configuration | Cycles |
+| --- | --- | ---: |
+| First blocked layout, one serial read buffer | Keep interpolation, no final cache | 1,000 |
+| Same serial prototype | Pure depth-2 / depth-2+3 lookup | 1,013 / 1,016 |
+| Direct parent landing buffers, lean setup | Four shared banks, pure lookup, no final cache | 1,016 |
+| Same, earlier path bits first | No final cache | 1,011 |
+| Wrong final-cache placement | Lowest eight groups, four parent banks, early bits | 1,075 |
+| Parallel read buffers, early bits | Four buffers, no final cache | 1,000 |
+| Parallel read buffers, high final groups | Four buffers, eight final groups | 979 |
+| Same high final cache | Six / seven / nine / ten groups | 978 / 977 / 985 / 989 |
+| Direct parent landing versus copied-parent buffers | Four shared parent banks, eight high final groups | 982 |
+| Read buffer count before fusion | Two / four / eight, seven final groups | 979 / 977 / 977 |
+| Static hash-arm ALU offload before fusion | 4 / 8 / 12 / 16 groups | 978 / 973 / 975 / 978 |
+| Parent-copy/XOR fusion | Six / seven / eight final groups, four read buffers | 974 / 970 / 979 |
+| Fusion plus static hash offload | Eight hash groups; six / seven / eight final groups | 976 / 972 / 975 |
+| Read buffer count after fusion | Two / four / eight, seven final groups | 977 / 970 / 974 |
+
+Static hash offload at eight groups helped the intermediate version but
+regressed the fused version. Keep `HASH_ALU_CHUNKS=0`; do not add the two
+improvements as if their time gains were independent. The lowest-final-cache
+and serialized-buffer regressions demonstrate why operation counts alone
+were not enough.
+
+### Acceptance and reproduction
+
+The new path is enabled only for the scored shape (height10, batch256,
+rounds16), with direct retained lookup through depth4. Its controls are
+`BLOCKED_LOOKUP=True`, `BLOCKED_READ_BANKS=4`,
+`BLOCKED_FINAL_CACHE_CHUNKS=7`, `BLOCKED_FUSE_PARENT_XOR=True`.
+The old depth-4 coverage and linear-preencoding settings apply to the
+fallback; they do not expand the blocked workspace. Generic and alternate
+path configurations retain their earlier behavior.
+
+Official **9/9**, built-in **3/3**, 32 frozen-reference seeds, eight full-word
+fixtures, exact emitted-instruction reconstruction, and exact record/padding
+and memory-boundary checks pass. The expanded local verifier also checks six
+extra shapes x three seeds (72/150/350/751/590/1614 cycles) and alternate
+path depths0/2/3 x three seeds (1013/1003/994). A first generic check caught
+an overly broad new cache-count assertion; it was scoped to blocked shapes
+and the extra-shape suite rerun. No official test was edited.
+
+```sh
+# Exact parent and final implementation: 987 / 970.
+python3 tune_kernel.py --blocked-lookup 0 1 --seeds 123 456 789
+# Isolate copy-consumer fusion on the new graph: 977 / 970.
+python3 tune_kernel.py --blocked-fuse-parent-xor 0 1 --seeds 123 456 789
+# Bounded accepted-neighborhood checks.
+python3 tune_kernel.py --blocked-final-cache-chunks 6 7 8 --seeds 123 456 789
+python3 tune_kernel.py --blocked-read-banks 2 4 8 --seeds 123 456 789
+python3 tests/submission_tests.py
+python3 perf_takehome.py
+python3 verify_kernel.py --extra-shapes
+python3 analyze_kernel.py
+```
+
+Next target the remaining two child-copy vectors per group, or another
+joint layout/lookup reduction, with full setup and storage accounting.
+Seventy elapsed cycles still separate this implementation from 900. No
+leaderboard lookup, submission, hash shortcut, or test/simulator change.

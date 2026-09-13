@@ -5,9 +5,11 @@ Uses the frozen simulator/reference; does not modify tests or their inputs.
 """
 
 from collections import Counter
+import argparse
 import json
 import random
 
+import perf_takehome as kernel
 from analyze_kernel import AnalyzedKernel, analyze
 from problem import SLOT_LIMITS, VLEN
 from tune_kernel import check, Input, Machine, Tree, build_mem_image, reference_kernel2
@@ -56,12 +58,41 @@ def verify_words(builder, label, tree_words, input_words):
     assert machine.mem[:indices] == original[:indices], label
     assert machine.mem[indices + workspace:values] == original[indices + workspace:values], label
     assert machine.mem[indices:indices + workspace] == [
-        word ^ HASH_STAGES[-1][1] for word in tree_words[15:15 + workspace]
+        0 if index is None else tree_words[index] ^ HASH_STAGES[-1][1]
+        for index in builder.workspace_node_indices
     ], label
     assert machine.cycle == len(builder.instrs)
 
 
+def verify_extra_shapes():
+    results = []
+    for height, rounds, batch in ((3, 5, 32), (4, 7, 64), (6, 11, 128),
+                                  (8, 12, 256), (10, 8, 256), (10, 20, 256)):
+        builder = kernel.KernelBuilder()
+        builder.build_kernel(height, 2**(height+1)-1, batch, rounds)
+        assert not builder.blocked_lookup
+        for seed in (123, 456, 789):
+            cycles = check(builder, seed, height, rounds, batch)
+        results.append(dict(shape=[height, rounds, batch], seeds=3, cycles=cycles))
+    original = kernel.PATH_REUSE_DEPTH, kernel.DIRECT_PATH_DEPTH
+    try:
+        for depth in (0, 2, 3):
+            kernel.PATH_REUSE_DEPTH = kernel.DIRECT_PATH_DEPTH = depth
+            builder = kernel.KernelBuilder()
+            builder.build_kernel(10, 2047, 256, 16)
+            assert not builder.blocked_lookup
+            for seed in (123, 456, 789):
+                cycles = check(builder, seed)
+            results.append(dict(path_depth=depth, seeds=3, cycles=cycles))
+    finally:
+        kernel.PATH_REUSE_DEPTH, kernel.DIRECT_PATH_DEPTH = original
+    return results
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--extra-shapes", action="store_true")
+    args = parser.parse_args()
     builder = AnalyzedKernel()
     builder.build_kernel(10, 2047, 256, 16)
     verify_emission(builder)
@@ -80,6 +111,8 @@ def main():
                      [rng.getrandbits(32) for _ in range(256)])
     report = analyze(builder)
     report.pop("rounds")
+    if args.extra_shapes:
+        report["extra_shape_checks"] = verify_extra_shapes()
     print(json.dumps(dict(schedule_emission="pass", random_seeds=32,
                           full_word_fixtures=8, **report), indent=2))
 
