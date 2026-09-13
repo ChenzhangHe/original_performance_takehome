@@ -54,9 +54,10 @@ DIRECT_PATH_DEPTH = 4
 ALU_VECTOR_BACKLOG = 12
 ALU_VECTOR_RESERVE_START = 60
 INPUT_ADDRESS_CHAIN_LENGTH = 2
-NODE_PREENCODE_DEPTH = 6  # Zero disables runtime preprocessing.
+NODE_PREENCODE_DEPTH = 5  # Zero disables runtime preprocessing.
 INPUT_ADDRESS_CONSUMER_PRIORITY = True
 ALU_FRAGMENT_ISSUE = True
+DIRECT_GATHER_ADDRESSES = True
 
 
 class KernelBuilder:
@@ -500,11 +501,11 @@ class KernelBuilder:
         assert NODE_PREENCODE_DEPTH in (0, 4, 5, 6, 7)
         assert PATH_REUSE_DEPTH in (0, 2, 3, 4)
         assert DIRECT_PATH_DEPTH in (0, 2, 3, 4) and DIRECT_PATH_DEPTH <= PATH_REUSE_DEPTH
-        # Legacy lookup experiments below used positive addresses. Reject
-        # those switches until their formulas are ported to S=5-A as well.
+        # Both index representations use retained-parity coefficient lookup.
+        # Legacy address-threshold lookup experiments remain disabled.
         assert (LOOKUP_DEPTH == PAIR_LOOKUP_DEPTH == 3
                 and DEPTH3_COEFF_SELECT and DEPTH4_BIT_SELECT), (
-            "Negative indices require the pair-coefficient low-bit lookup path"
+            "Index representations require the pair-coefficient low-bit lookup path"
         )
         chunk_count = batch_size // VLEN
         scored_shape = (forest_height, batch_size, rounds) == (10, 256, 16)
@@ -533,6 +534,8 @@ class KernelBuilder:
         self.preencoded_node_count = encode_node_end - encode_node_first if preencode else 0
         if preencode:
             assert self.preencoded_node_count <= batch_size
+        positive_addresses = scored_shape and DIRECT_GATHER_ADDRESSES and DIRECT_PATH_DEPTH >= 4
+        self.direct_gather_addresses = positive_addresses
 
         forest_values_p = 7
         inp_values_p = forest_values_p + n_nodes + batch_size
@@ -552,10 +555,11 @@ class KernelBuilder:
             self.add("valu", ("vbroadcast", vector, scalar))
             return vector
 
-        # For depths >= 2, idx holds S=5-A (mod 2**32), not an address.
-        # A'=2*A-5-p becomes S'=2*S+p: one multiply_add.
-        depth2_left_base = vector_const((-6) & 0xFFFFFFFF, "depth2_left_base")
-        depth2_right_base = vector_const((-8) & 0xFFFFFFFF, "depth2_right_base")
+        # The fallback holds S=5-A and updates S'=2*S+p. The scored direct
+        # path constructs A at its first gather and then keeps actual addresses.
+        if not positive_addresses:
+            depth2_left_base = vector_const((-6) & 0xFFFFFFFF, "depth2_left_base")
+            depth2_right_base = vector_const((-8) & 0xFFFFFFFF, "depth2_right_base")
         # Active lookup modes use scalar parity extraction. Keep the vector
         # alias for non-direct experimental modes, without broadcasting it on
         # the scored direct path.
@@ -691,6 +695,51 @@ class KernelBuilder:
                     hash_constants[multiplier] = vector_const(
                         multiplier, f"const_{multiplier:x}"
                     )
+
+        if positive_addresses:
+            # Keep A itself once gathers begin. Before then, accumulate path
+            # bits directly into the first gather address. Derive constants
+            # from shared scalars so this representation does not require a
+            # separate constant load for every base, weight and transition.
+            readonly_zero = self.alloc_scratch("positive_zero")
+            negative_weights = {}
+            neg2 = self.alloc_scratch("path_weight_1", VLEN)
+            self.add("alu", ("-", neg2, readonly_zero, two))
+            self.add("valu", ("vbroadcast", neg2, neg2))
+            negative_weights[1] = neg2
+            for shift in (2, 3):
+                vector = self.alloc_scratch(f"path_weight_{shift}", VLEN)
+                self.add("valu", ("+", vector, negative_weights[shift - 1], negative_weights[shift - 1]))
+                negative_weights[shift] = vector
+            address_bias = self.alloc_scratch("address_bias", VLEN)
+            self.add("alu", ("-", address_bias, readonly_zero, address_five))
+            self.add("valu", ("vbroadcast", address_bias, address_bias))
+            delta = n_nodes - encode_node_first if preencode else 0
+            right4 = vector_const(37 + delta, "address_right_4")
+            left4 = self.alloc_scratch("address_left_4", VLEN)
+            self.add("valu", ("+", left4, right4, negative_weights[3]))
+            if preencode:
+                thirty_two = self.alloc_scratch("positive_32", VLEN)
+                self.add("alu", ("<<", thirty_two, address_step, two))
+                self.add("valu", ("vbroadcast", thirty_two, thirty_two))
+                copied_bias = self.alloc_scratch("copied_bias", VLEN)
+                self.add("valu", ("-", copied_bias, thirty_two, right4))
+                five_vector = vector_const(5, "positive_five")
+                exiting_bias = self.alloc_scratch("exiting_bias", VLEN)
+                self.add("valu", ("multiply_add", exiting_bias, copied_bias, two, five_vector))
+            else:
+                copied_bias = exiting_bias = address_bias
+            left5 = self.alloc_scratch("address_left_5", VLEN)
+            right5 = self.alloc_scratch("address_right_5", VLEN)
+            # If only depth 4 was copied, depth 5 addresses must exit the
+            # workspace immediately. Otherwise both bases share its offset.
+            first_base_bias = exiting_bias if preencode and encode_last == 4 else copied_bias
+            self.add("valu", ("multiply_add", left5, left4, two, first_base_bias))
+            self.add("valu", ("multiply_add", right5, right4, two, first_base_bias))
+            address_bases = {4: (left4, right4), 5: (left5, right5)}
+            direct_vectors = [*negative_weights.values(), address_bias, right4, left4, left5, right5]
+            if preencode:
+                direct_vectors.extend((thirty_two, copied_bias, five_vector, exiting_bias))
 
         # Fold initialization into the same DAG as the kernel.  Main operations
         # gain dependencies on the setup instructions that produce their inputs.
@@ -839,6 +888,10 @@ class KernelBuilder:
                 depth = round_no % (forest_height + 1)
                 if depth == 0:
                     path_bits = {}
+                    if positive_addresses:
+                        first_gather_depth = 5 if depth4_cached(round_no + 4, chunk_no) else 4
+                        if first_gather_depth > min(forest_height, rounds - 1 - round_no):
+                            first_gather_depth = None
                     reuse_depth = min(PATH_REUSE_DEPTH, forest_height, rounds - 1 - round_no)
                     if reuse_depth >= 4 and not (
                         depth4_cached(round_no + 4, chunk_no)
@@ -885,12 +938,11 @@ class KernelBuilder:
                         selected,
                     )
                     if needs_index and depth < forest_height and round_no < rounds - 1:
-                        # Next S is (p0 ? -6 : -8) + p1. Prepare its
-                        # base while this round hashes, after the last p0 read.
-                        idx_ready = select(
-                            chunk_idx, root_parity, depth2_left_base,
-                            depth2_right_base, selected,
-                        )
+                        # Prepare the first gather's base, or the fallback's
+                        # S2 base (p0 ? -6 : -8), while this round hashes.
+                        left_base, right_base = (address_bases[first_gather_depth] if positive_addresses
+                                                 else (depth2_left_base, depth2_right_base))
+                        idx_ready = select(chunk_idx, root_parity, left_base, right_base, selected)
                 elif depth == 2 and LOOKUP_DEPTH >= 2 and PAIR_LOOKUP_DEPTH >= 2:
                     half_mask, half = lookup_mask(1, chunk_tmp1, lookup_barrier)
                     slope = select(
@@ -1142,19 +1194,24 @@ class KernelBuilder:
                     # Dynamic gathers may read any node in their level, so
                     # every copy-store for that level must have committed.
                     extra_ready = [encoded_address_ready, *encoded_levels_ready[depth]] if encoded_node else []
-                    # Decode only gathered addresses; cached lookup uses S.
-                    address_ready = [
-                        emit("alu", ("-", chunk_node + lane, address_constant, chunk_idx + lane), idx_ready, extra_ready)
-                        for lane in range(VLEN)
-                    ]
-                    node_loads = [
-                        emit(
-                            "load",
-                            ("load_offset", chunk_node, chunk_node, lane),
-                            address_ready[lane],
-                        )
-                        for lane in range(VLEN)
-                    ]
+                    if positive_addresses:
+                        node_loads = [
+                            emit("load", ("load_offset", chunk_node, chunk_idx, lane),
+                                 idx_ready[lane] if isinstance(idx_ready, list) else idx_ready,
+                                 extra_ready)
+                            for lane in range(VLEN)
+                        ]
+                    else:
+                        # Decode S only at gathered levels on the fallback.
+                        address_ready = [
+                            emit("alu", ("-", chunk_node + lane, address_constant, chunk_idx + lane), idx_ready, extra_ready)
+                            for lane in range(VLEN)
+                        ]
+                        node_loads = [
+                            emit("load", ("load_offset", chunk_node, chunk_node, lane), address_ready[lane])
+                            for lane in range(VLEN)
+                        ]
+                    node_address_reads = list(node_loads)
                     if not encoded_node:
                         node_loads = [
                             emit(
@@ -1173,6 +1230,18 @@ class KernelBuilder:
                     )
                 if cached_lookup:
                     node_pool_uses.append((chunk_node, lookup_start, len(ops), NODE_VIRTUAL_VECTORS))
+                if (positive_addresses and first_gather_depth is not None
+                        and depth >= first_gather_depth and round_no < rounds - 1
+                        and depth < forest_height):
+                    # A' = 2*A - 5 - p. Prepare the affine base while hashing,
+                    # but do not overwrite A until every gather has read it.
+                    # For copied A+d, use -5-d within the copy and -5-2*d
+                    # when returning to the original forest address space.
+                    bias = ((exiting_bias if depth == encode_last else copied_bias)
+                            if preencode and encode_first <= depth <= encode_last else address_bias)
+                    index_base_ready = emit(
+                        "valu", ("multiply_add", chunk_idx, chunk_idx, two, bias), node_address_reads
+                    )
                 for stage, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     if stage == 3:
                         continue  # Already evaluated together with stage 2.
@@ -1270,7 +1339,8 @@ class KernelBuilder:
                     continue
 
                 # Encoded hash parity p is the inverse of raw hash parity.
-                # Keep p at the root, then use S'=2*S+p at deeper levels.
+                # Keep p at the root; later use S'=2*S+p on the fallback or
+                # subtract p from the direct path's precomputed address base.
                 parity_dest = chunk_idx if depth == 0 else chunk_tmp1
                 if depth < retained_depth:
                     # Unique logical producer per group/round; its storage is
@@ -1287,6 +1357,23 @@ class KernelBuilder:
                     continue
                 if not needs_index:
                     idx_ready = None
+                    continue
+                if positive_addresses:
+                    if first_gather_depth is None:
+                        idx_ready = None
+                    elif depth < first_gather_depth - 1:
+                        idx_ready = emit(
+                            "valu", ("multiply_add", chunk_idx, parity_dest,
+                                     negative_weights[first_gather_depth - 1 - depth], chunk_idx),
+                            parity, idx_ready,
+                        )
+                    else:
+                        base_ready = idx_ready if depth == first_gather_depth - 1 else index_base_ready
+                        idx_ready = [
+                            emit("alu", ("-", chunk_idx + lane, chunk_idx + lane, parity_dest + lane),
+                                 parity[lane], base_ready)
+                            for lane in range(VLEN)
+                        ]
                     continue
                 if depth == 1:
                     idx_ready = emit_scalar_vector("+", chunk_idx, chunk_idx, parity_dest, parity, idx_ready)
@@ -1326,8 +1413,10 @@ class KernelBuilder:
         self.schedule(ops)
         # Reclaim index storage only after its actual last scheduled access.
         # Final-cache groups have no index uses in their second traversal.
+        # Direct-address constants can also be reused after their last access.
         self.allocate_node_lifetimes(ops, node_pool_uses,
-                                     tuple(depth4_vectors if cache_depth4 else ()) + tuple(encode_buffers) +
+                                     tuple(depth4_vectors if cache_depth4 else ()) +
+                                     tuple(direct_vectors if positive_addresses else ()) + tuple(encode_buffers) +
                                      tuple(range(idx, idx + batch_size, VLEN)))
         for bundle in self.instrs:
             for engine in list(bundle):

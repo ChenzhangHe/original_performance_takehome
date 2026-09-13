@@ -1706,3 +1706,143 @@ both switches off, `NODE_PREENCODE_DEPTH=0` still restores the earlier
 new switches remain enabled, as an exact historical-baseline reproduction.
 No leaderboard research, submission, simulator change, or runtime input
 precomputation was performed in this iteration.
+
+## Iteration 32 — direct addresses with derived constants and smaller preprocessing
+
+Date: 2026-09-13. Parent `3f2f4e2`. Accepted **987 cycles**, scratch
+**1,473**. This improves elapsed cycles by only one (about 0.10%), but also
+removes **10 load slots**, **30.625 vector-equivalent compute operations**,
+and **8 stores**. No simulator or official test changes.
+
+### Why the previously rejected address representation now wins
+
+Let p be encoded-hash parity. For an ordinary tree address A, the next
+address is `A'=2*A-5-p`. Construct the first gather address directly from
+retained path bits: at depth g its all-zero-parity base is `2^(g+1)+5`;
+subtract `p0*2^(g-1)`, `p1*2^(g-2)`, ..., `p(g-1)`. The first base uses the
+existing root-parity select; subsequent weighted terms use MACs and the
+last term uses per-lane subtraction. Cached node lookup still uses retained
+parities, not the address bits of this ahead-of-time base.
+
+After a gather, prepare `2*A+bias` while hashing. This overwrite waits for
+ALL eight loads to read their addresses. Subtract each parity lane afterward,
+and let its next load depend on that lane's address. Final/leaf rounds omit
+unused address updates, as before.
+
+For the copied workspace offset d=`n_nodes-15`:
+
+- Within the copied range: `a'=2*a-5-d-p`.
+- Leaving it: `A'=2*a-5-2*d-p`.
+- Outside it: `A'=2*A-5-p`.
+
+Memory dependencies on every store in the selected copied level remain
+explicit. Only scored shapes with direct lookup through depth 4 use this
+representation. Generic shapes and alternate lookup modes retain S=5-A.
+
+The old direct-address probe loaded almost every base/weight separately.
+Instead, derive -2 from an untouched zero word and the existing scalar 2;
+double it to -4/-8; derive -5 from zero and the scalar 5. Only the depth-4
+right base needs a new immediate load. Build its left base with -8, build
+32 from 8<<2, derive the copied bias as `32-right4`, and derive the exit
+bias as `2*copied_bias+5`. Both depth-5 bases follow by MAC from depth 4.
+All these operations execute at runtime using ordinary simulator slots.
+The depth-4-only option uses the EXIT bias for its depth-5 bases and is
+separately checked; it must not point into uncopied workspace.
+
+With copied depths 4--6, this version reaches 989 at first cache 26 and
+988 at cache 27. Reducing the copy to depths **4--5** gives **987** at cache
+26; cache 27 regresses to 990. Retain the original first/final cache counts
+26/1, not a wider cache or any new scheduling policy.
+
+### Full accounting, including setup
+
+- Direct construction deletes one compute equivalent at each first gather:
+  32 groups in the first traversal and 31 in the second, **63** total.
+- New address setup replaces two old broadcast bases with 12 vector
+  operations and three scalar operations: net **+10.375** equivalents.
+- Dropping depth-6 preprocessing removes eight copy XORs and 16 scalar
+  pointer updates, but restores 32 gathered-node encodings: net **+22**.
+- Net: `-63 + 10.375 + 22 = -30.625` compute equivalents. Derived address
+  setup saves two net loads; the smaller copy saves eight more.
+
+Accepted slots: load **1,913**, VALU **5,814**, ALU **10,468**, flow **939**,
+store **38**. Weighted compute **7,122.5** (optimistic floor **950**), versus
+7,153.125 (floor 954). Other floors: load **957**, VALU **969**, ALU **873**,
+flow **939**. First/last gather **54/976**, drain **10**, gathers **1,832**.
+Necessary deficits at 900: **372.5 compute equivalents, 113 loads, 39 flow**.
+The aggregate improvements must not be presented as a similar time speedup.
+
+Selected existing policy:
+`fragment_balanced_adaptive_tail_hetero_360_220_220_140_750`.
+398 vector operations offload to ALU; 56 span multiple cycles, max span 25.
+DCE removes 11 constants, including the now-unused gather-decode constant.
+Address constants join the existing lifetime reuse pool after their last
+scheduled reads; scratch falls **1,497 -> 1,473** at unchanged 987 cycles.
+This is still 33 more scratch words than the parent. Workspace shrinks from
+112 to **48** index words; the other 208 index words and entire forest remain
+untouched. No input-dependent work is performed in the Python builder.
+
+### Rejected probes in this turn
+
+All probes below checked frozen seeds 123/456/789. A tie is not counted as
+a performance improvement. Earlier address tests were rerun because input
+readiness and fragment issue changed the graph in iteration 31.
+
+| Experiment | Configurations | Cycles |
+| --- | --- | --- |
+| Reuse cache depth-4 loads for preprocessing | Scalar encoding, copy depths6 / 5 / 7 | 988 / 989 / 995 |
+| Same shared copy, vector encoding | Depths6 / 5 | 991 / 990 |
+| Full direct addresses, separately loaded constants | Depth6, cache26 / 25 / 27 | 990 / 992 / 989 |
+| Same separate constants | Depth5 / 7, cache26 | 989 / 995 |
+| Tail-only direct addresses | Derived / immediate constants, cache26 / 27 | 990 / 995 for both |
+| Tail-only base MAC, derived constants | Cache26 / 27 | 990 / 989 |
+| Tail base MAC, remove unused left base, more first cache | Depth6, cache28 / 29; depth5, cache28 / 29 | 990 / 997; 990 / 998 |
+| Replace setup loads by one exact ALU expression | Maximum synthesis depth1 / 2 / 3 | 990 / 991 / 990 |
+| Extra final caches on highest groups, retaining group0 | First26, final2 / 3 / 4 | 996 / 1,009 / 1,022 |
+| Same high-group final caches | First24, final3 / 4 | 988 / 1,000 |
+| Spread final caches across middle/high groups | First26, final3 / 4 | 1,006 / 1,012 |
+| Setup first-use priority cap | 5 / 6 | 990 / 992 |
+| Address anchors inherit their highest consumer group | Existing cap4 | 990 |
+| Scalarize index FMAs in rounds13/14 | Lowest8 / 16 / 32 groups | 988 / 989 / 988 |
+| Scalarize other index FMAs | Round9 all32; rounds2/3/13/14 lowest8; rounds4--9 lowest8 | 988 / 988 / 988 |
+| Release proven parity RAW edges per completed vector lane | Parent; full direct cache26 / 27; tail-direct; scalar-tail | 988; 990 / 989; 990; 988 |
+| Longer input address chains on parent | 3 / 4 / 6 / 8 | 990 / 992 / 990 / 995 |
+| Shared copies on new derived-address/depth5 candidate | Scalar / vector encoding | 988 / 988 |
+| Longer input chain on new candidate | Chain3 | 988 |
+| Derived direct addresses with copy depth4 only | Correct exit to original depth5 addresses | 988 |
+
+Tail-only addresses remove 27 net compute equivalents but still take 990.
+The standalone constant synthesizer removes 7--9 loads but increases setup
+dependencies and does not win. Scalarizing index FMAs mostly displaces
+existing binary-operation offload. Per-lane parity release changes 3,584
+eligible edges and can reduce scratch, but does not improve cycles; do not
+relax the accepted kernel's whole-vector completion barriers on this basis.
+These probes are kept out of the implementation.
+
+### Acceptance and reproduction
+
+Official **9/9**, built-in **3/3**, frozen seeds **1000--1031**, eight full-word
+fixtures, exact primitive-emission reconstruction, and memory-boundary checks
+pass. Six extra shapes x seeds123/456/789 remain at **72,150,350,751,590,1614**.
+Alternate (PATH,DIRECT)=(0,0)/(2,2)/(3,3) x three seeds pass at
+**1,013/1,003/994** with the new depth-5 preprocessing default.
+
+Direct-address A/B across preencoding depths 0/4/5/6/7 passes three seeds.
+With direct addresses OFF: **995/989/988/988/994**. With them ON:
+**994/988/987/989/994**. Only the 987 default is the accepted performance
+claim; the others are configuration checks. Lifetime reuse is checked again
+after enabling the address constants in the reuse pool.
+
+```sh
+python3 tune_kernel.py --node-preencode-depth 5 6 --direct-gather-addresses 0 1 --seeds 123 456 789
+python3 tests/submission_tests.py
+python3 perf_takehome.py
+python3 verify_kernel.py
+python3 analyze_kernel.py
+```
+
+The explicit parent reproduction is `--direct-gather-addresses 0
+--node-preencode-depth 6` with the other defaults. No leaderboard query or
+submission was performed. The next target remains structural body reduction
+with setup, flow and live-storage costs included, not another unconstrained
+priority sweep.

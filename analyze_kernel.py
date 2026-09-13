@@ -54,6 +54,7 @@ def analyze(builder):
         "max_fragment_span": max((max(ts) - min(ts) + 1 for ts in builder.lane_issue_cycles.values()), default=0),
         "pruned_constant_loads": builder.pruned_constant_loads,
         "preencoded_nodes": builder.preencoded_node_count,
+        "direct_gather_addresses": builder.direct_gather_addresses,
         "engines": engines,
         "gather": {
             "first": min(gathers), "last": max(gathers), "slots": len(gathers),

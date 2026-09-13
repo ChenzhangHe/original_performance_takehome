@@ -1,5 +1,35 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 32, **987 cycles**, scratch
+**1,473**, parent `3f2f4e2`. Direct gather addresses finally win when their
+constants are derived from shared scalars and the copied range is reduced
+to depths 4--5 (48 nodes). Before the first gather, accumulate weighted path
+bits into A; afterward prepare `2*A+bias` while hashing and subtract parity.
+Copied-address and exit biases are explicit. Reuse dead address-constant
+vectors after their last scheduled access; this lowers the initial candidate's
+scratch from 1,497 to 1,473 without changing its issue schedule.
+
+Slots: load **1,913**, VALU **5,814**, ALU **10,468**, flow **939**, store
+**38**. Net versus iteration 31: **-10 loads**, **-30.625 compute equivalents**,
+**-8 stores**, but only **ONE elapsed cycle**. Weighted work **7,122.5**,
+optimistic compute floor **950**. Necessary 900-cycle deficits are now
+**372.5 compute equivalents, 113 loads, 39 flow**; 87 elapsed cycles remain.
+First/last gather **54/976**, drain 10. These are bounds on our current work,
+not evidence that the problem itself cannot reach 900.
+
+The important result is representation/setup co-design, not a claim that
+direct addresses alone are faster. Independently loaded address constants,
+tail-only addresses, more cached groups, constant-load synthesis, scalar
+index FMAs, and narrow per-lane parity release did not beat 988. The log
+records their measured tradeoffs. Next improvements must include both body
+cost and setup/readiness; avoid repeating those combinations unchanged.
+Use `--direct-gather-addresses 0 --node-preencode-depth 6` to recover the
+988-cycle parent. The generic and non-direct lookup paths retain S=5-A.
+Full official, frozen-reference, schedule-emission, extra-shape and memory
+boundary acceptance passes. No leaderboard recheck or submission this turn.
+
+The implementation status below is historical.
+
 Latest accepted implementation: iteration 31, **988 cycles**, scratch
 **1,440**, parent `0c89047`. This is a six-cycle improvement, not an
 operation-count reduction. Input-address anchors now carry their consuming

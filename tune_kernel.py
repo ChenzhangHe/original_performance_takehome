@@ -54,11 +54,12 @@ def main():
         "INPUT_ADDRESS_CHAIN_LENGTH",
         "NODE_PREENCODE_DEPTH",
         "INPUT_ADDRESS_CONSUMER_PRIORITY", "ALU_FRAGMENT_ISSUE",
+        "DIRECT_GATHER_ADDRESSES",
     ):
         parser.add_argument("--" + name.lower().replace("_", "-"), type=int, nargs="+", default=[getattr(kernel, name)])
     parser.add_argument("--seeds", type=int, nargs="+", default=[123])
     args = parser.parse_args()
-    for hash_chunks, bit_mask_chunks, path_depth, cache_chunks, direct_depth, backlog, reserve_start, final_cache_chunks, address_chain, preencode_depth, input_priority, fragment_issue in product(
+    for hash_chunks, bit_mask_chunks, path_depth, cache_chunks, direct_depth, backlog, reserve_start, final_cache_chunks, address_chain, preencode_depth, input_priority, fragment_issue, direct_addresses in product(
         args.hash_alu_chunks, args.bit_mask_valu_chunks, args.path_reuse_depth,
         args.depth4_cache_chunks, args.direct_path_depth, args.alu_vector_backlog,
         args.alu_vector_reserve_start,
@@ -66,6 +67,7 @@ def main():
         args.input_address_chain_length,
         args.node_preencode_depth,
         args.input_address_consumer_priority, args.alu_fragment_issue,
+        args.direct_gather_addresses,
     ):
         kernel.HASH_ALU_CHUNKS = hash_chunks
         kernel.BIT_MASK_VALU_CHUNKS = bit_mask_chunks
@@ -79,6 +81,7 @@ def main():
         kernel.NODE_PREENCODE_DEPTH = preencode_depth
         kernel.INPUT_ADDRESS_CONSUMER_PRIORITY = bool(input_priority)
         kernel.ALU_FRAGMENT_ISSUE = bool(fragment_issue)
+        kernel.DIRECT_GATHER_ADDRESSES = bool(direct_addresses)
         start = time.perf_counter()
         builder = kernel.KernelBuilder()
         builder.build_kernel(10, 2047, 256, 16)
@@ -98,6 +101,7 @@ def main():
                               node_preencode_depth=preencode_depth,
                               input_address_consumer_priority=bool(input_priority),
                               alu_fragment_issue=bool(fragment_issue),
+                              direct_gather_addresses=bool(direct_addresses),
                               cycles=cycles, scratch=builder.scratch_ptr, policy=builder.schedule_policy,
                               slots=dict(slots), checked_seeds=args.seeds, build_seconds=round(elapsed, 3))), flush=True)
 
