@@ -63,6 +63,9 @@ BLOCKED_READ_BANKS = 4
 BLOCKED_FINAL_CACHE_CHUNKS = 7
 BLOCKED_FUSE_PARENT_XOR = True
 BLOCKED_FUSE_SETUP_XOR = True
+BLOCKED_SETUP_DEADLINES = True
+BLOCKED_EARLY_TAIL_SELECT = True
+BLOCKED_DROP_UNUSED_WEIGHT = True
 
 
 class KernelBuilder:
@@ -149,6 +152,7 @@ class KernelBuilder:
                 deps=list(deps),
                 chunk=setup_chunk,
                 round=-1,
+                is_setup=True,
                 local_seq=op_id,
             )
             for dep in deps:
@@ -518,6 +522,9 @@ class KernelBuilder:
                           and DIRECT_GATHER_ADDRESSES and DIRECT_PATH_DEPTH >= 4)
         self.blocked_lookup = blocked_lookup
         self.blocked_setup_xor_fused = blocked_lookup and BLOCKED_FUSE_SETUP_XOR
+        self.blocked_setup_deadlines = blocked_lookup and BLOCKED_SETUP_DEADLINES
+        self.blocked_early_tail_select = blocked_lookup and BLOCKED_EARLY_TAIL_SELECT
+        self.blocked_unused_weight_pruned = blocked_lookup and BLOCKED_DROP_UNUSED_WEIGHT
         assert BLOCKED_READ_BANKS in (1, 2, 4, 8)
         assert not blocked_lookup or 0 <= BLOCKED_FINAL_CACHE_CHUNKS <= chunk_count
         self.fragment_alu_enabled = scored_shape and ALU_FRAGMENT_ISSUE
@@ -808,7 +815,10 @@ class KernelBuilder:
             # A6=B+(73-block_base)-2*p4-p5, where encoded parity is inverted.
             block_exit_bias = vector_const((73-block_base) & 0xFFFFFFFF, "block_exit_bias")
             block_neg4 = negative_weights[2]
-            for shift in (1, 2, 3):
+            # Every blocked group first gathers at depth 4 (or has no final
+            # gather). Only depth-1/2 accumulation needs weights -16/-8;
+            # depth 3 uses block_neg4. The old -32 broadcast has no consumer.
+            for shift in ((1, 2) if BLOCKED_DROP_UNUSED_WEIGHT else (1, 2, 3)):
                 negative_weights[shift] = vector_const((-4*(1 << shift)) & 0xFFFFFFFF,
                                                        f"block_weight_{shift}")
             address_bases[4] = (vector_const(block_base+28, "block_left"),
@@ -842,9 +852,10 @@ class KernelBuilder:
         block_children_base = path_bits_base + rounds * batch_size
         ops = setup_ops
         setup_count = len(setup_ops)
+        setup_deadline_end = setup_count
         shared_select_uses = []
         node_pool_uses = []
-        emit_context = {"chunk": -1, "round": -1, "local_seq": 0}
+        emit_context = {"chunk": -1, "round": -1, "local_seq": 0, "is_setup": False}
 
         def emit(engine, slot, *deps):
             op_id = len(ops)
@@ -886,7 +897,7 @@ class KernelBuilder:
 
         encoded_levels_ready = {}
         if preencode:
-            emit_context.update(chunk=SETUP_CHUNK, round=-1, local_seq=0)
+            emit_context.update(chunk=SETUP_CHUNK, round=-1, local_seq=0, is_setup=True)
             source_ready = emit("load", ("const", encode_src, forest_values_p + encode_node_first))
             dest_ready = emit("load", ("const", encode_dst, forest_values_p + n_nodes))
             encoded_address_ready = emit("load", ("const", encoded_address_five, 5 + n_nodes - encode_node_first))
@@ -908,7 +919,7 @@ class KernelBuilder:
                         dest_ready = emit("alu", ("+", encode_dst, encode_dst, address_step), written)
                 encoded_levels_ready[level] = level_stores
             setup_deadline_end = len(ops)
-            emit_context.update(chunk=-1, round=-1, local_seq=0)
+            emit_context.update(chunk=-1, round=-1, local_seq=0, is_setup=False)
 
         # Keep these scalar addresses live through output stores, avoiding
         # a separate flow add_imm for each chunk at the end of execution.
@@ -1206,24 +1217,47 @@ class KernelBuilder:
                       and round_no == rounds - 1):
                     # Select coefficients before the newest parity arrives;
                     # unlike quartet interpolation, only one MAC waits for it.
-                    intercept_result = chunk_node + VLEN
-                    masks = [path_bits[2][0], path_bits[1][0], path_bits[0][0]]
-                    mask_ready = [path_bits[2][1], path_bits[1][1], path_bits[0][1]]
-                    order = sorted(range(8), key=lambda p: ((5 - 22 - 2*p) >> 1) & 7)
+                    pairs = sorted(range(8), key=lambda p: ((5 - 22 - 2*p) >> 1) & 7)
+                    if self.blocked_early_tail_select:
+                        # The same 14 selects + one MAC, but build quartets
+                        # using p0 then p1 before p2 arrives. Reverse the
+                        # three-bit table coordinate to preserve the lookup.
+                        masks = [path_bits[d][0] for d in (0, 1, 2)]
+                        mask_ready = [path_bits[d][1] for d in (0, 1, 2)]
+                        order = [pairs[((i & 1) << 2) | (i & 2) | (i >> 2)] for i in range(8)]
+                        dlow, dhigh, elow, ehigh = [chunk_node + i * VLEN for i in range(4)]
 
-                    def coefficient_tree(values, destination, *deps):
-                        left = select(chunk_tmp1, masks[0], values[1], values[0], mask_ready[0], *deps)
-                        right = select(chunk_tmp2, masks[0], values[3], values[2], mask_ready[0], *deps)
-                        lower = select(destination, masks[1], chunk_tmp2, chunk_tmp1, left, right, mask_ready[1])
-                        left = select(chunk_tmp1, masks[0], values[5], values[4], lower)
-                        right = select(chunk_tmp2, masks[0], values[7], values[6], lower)
-                        upper = select(chunk_tmp1, masks[1], chunk_tmp2, chunk_tmp1, left, right, mask_ready[1])
-                        return select(destination, masks[2], chunk_tmp1, destination, lower, upper, mask_ready[2])
+                        def coefficient_quartet(values, destination, *deps):
+                            left = select(chunk_tmp1, masks[0], values[1], values[0], mask_ready[0], *deps)
+                            right = select(chunk_tmp2, masks[0], values[3], values[2], mask_ready[0], *deps)
+                            return select(destination, masks[1], chunk_tmp2, chunk_tmp1, left, right, mask_ready[1])
 
-                    slope = coefficient_tree([depth4_vectors[2*p+1] for p in order], chunk_node)
-                    intercept = coefficient_tree([depth4_vectors[2*p] for p in order], intercept_result, slope)
-                    selected = emit("valu", ("multiply_add", chunk_node, interpolation, chunk_node, intercept_result),
-                                    slope, intercept, interpolation_ready)
+                        dl = coefficient_quartet([depth4_vectors[2*p+1] for p in order[:4]], dlow)
+                        dh = coefficient_quartet([depth4_vectors[2*p+1] for p in order[4:]], dhigh, dl)
+                        el = coefficient_quartet([depth4_vectors[2*p] for p in order[:4]], elow, dh)
+                        eh = coefficient_quartet([depth4_vectors[2*p] for p in order[4:]], ehigh, el)
+                        slope = select(dlow, masks[2], dhigh, dlow, dl, dh, mask_ready[2])
+                        intercept = select(elow, masks[2], ehigh, elow, el, eh, mask_ready[2])
+                        selected = emit("valu", ("multiply_add", chunk_node, interpolation, dlow, elow),
+                                        slope, intercept, interpolation_ready)
+                    else:
+                        intercept_result = chunk_node + VLEN
+                        masks = [path_bits[2][0], path_bits[1][0], path_bits[0][0]]
+                        mask_ready = [path_bits[2][1], path_bits[1][1], path_bits[0][1]]
+
+                        def coefficient_tree(values, destination, *deps):
+                            left = select(chunk_tmp1, masks[0], values[1], values[0], mask_ready[0], *deps)
+                            right = select(chunk_tmp2, masks[0], values[3], values[2], mask_ready[0], *deps)
+                            lower = select(destination, masks[1], chunk_tmp2, chunk_tmp1, left, right, mask_ready[1])
+                            left = select(chunk_tmp1, masks[0], values[5], values[4], lower)
+                            right = select(chunk_tmp2, masks[0], values[7], values[6], lower)
+                            upper = select(chunk_tmp1, masks[1], chunk_tmp2, chunk_tmp1, left, right, mask_ready[1])
+                            return select(destination, masks[2], chunk_tmp1, destination, lower, upper, mask_ready[2])
+
+                        slope = coefficient_tree([depth4_vectors[2*p+1] for p in pairs], chunk_node)
+                        intercept = coefficient_tree([depth4_vectors[2*p] for p in pairs], intercept_result, slope)
+                        selected = emit("valu", ("multiply_add", chunk_node, interpolation, chunk_node, intercept_result),
+                                        slope, intercept, interpolation_ready)
                     val_ready = emit("valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected)
                 elif (depth == 4 and depth4_cached(round_no, chunk_no) and DEPTH4_BIT_SELECT):
                     upper_result = chunk_node + VLEN
@@ -1560,7 +1594,7 @@ class KernelBuilder:
                     ops[writer]["deps"].append(previous_use)
                 previous_use = reader
         self.prune_unused_constants(ops, node_pool_uses)
-        if preencode:
+        if preencode or self.blocked_setup_deadlines:
             # DCE removes only constants emitted before the copy sequence.
             setup_deadline_end -= self.pruned_constant_loads
             self.prioritize_setup_by_first_use(ops, setup_deadline_end)
@@ -1590,7 +1624,9 @@ class KernelBuilder:
         """Delay setup priority to its first consuming round, without new deps.
 
         This only changes scheduling metadata. Memory-copy dependencies stay
-        intact. An explicit prefix boundary separates setup from body ops.
+        intact. An explicit prefix boundary separates setup from body ops;
+        is_setup remains immutable for analysis. Capping the priority at
+        round 4 avoids retaining setup inputs until the final cached round.
         """
         needed = [len(ops)] * len(ops)
         for i, op in enumerate(ops):
@@ -1603,6 +1639,7 @@ class KernelBuilder:
                     needed[dep] = min(needed[dep], needed[i])
         for i, op in enumerate(ops):
             if i < setup_end:
+                assert op["is_setup"]
                 op["round"] = min(4, needed[i])
 
     def prune_unused_constants(self, ops, uses):

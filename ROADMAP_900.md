@@ -1,5 +1,51 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 35, **955 cycles**, scratch
+**1,459**, parent `468f713`. This is **14 cycles faster** than 969. Enable
+consumer-round setup priorities on the blocked graph, order the final
+coefficient selects by early path bits, and omit one unused address-weight
+load/broadcast. The first combined lookup moves **67 -> 54**. No hash or
+body lookup-count reduction is claimed.
+
+The changes interact: setup priorities alone give960; early-tail selection
+alone ties969; removing the unused weight alone regresses to971. Setup
+priorities + early selection + weight removal give **955**. All eight A/B
+combinations are in iteration35 of the log and exposed by tuning switches.
+Keep semantic setup identity separate from its scheduling round; otherwise
+deferred setup vloads pollute the first-lookup metric. The analyzer and
+local verifier now check that distinction.
+
+Slots: load **1,826**, VALU **5,604**, ALU **10,616**, flow **891**, store
+**40**. Weighted compute **6,931**, optimistic compute floor still **925**.
+Necessary aggregate deficits at900 are **181 compute equivalents and
+26 loads**, with nine spare flow slots. Combined lookup traffic remains
+**1,736**, first/last **54/944**, drain10, conditional finish bound922.
+There are still **55 elapsed cycles** to900. The one-equivalent work saving
+is much smaller than the elapsed-cycle improvement; readiness was the win.
+
+Next, in order:
+
+1. Reduce body work on this new readiness graph. Direct child landing has
+   now been remeasured here: **963**, or **961** with same-cycle WAR,
+   despite saving30 net compute equivalents. Its load chain is still too
+   serial. A partitioned/banked landing proposal must show how it preserves
+   load concurrency, counts any merge/copy cost, and fits live scratch.
+2. Require a joint compute/load reduction for the remaining900 budget.
+   More final caching alone is not a route: eight groups take961 and
+   flow904, already over the900 flow budget; six groups take962.
+3. Revisit setup/readiness alongside a genuinely changed body, with the
+   existing eight-way A/B as the control. Delaying setup all the way to
+   round15 needs1,595 scratch words; the limit remains1,536. Do not trade
+   away the new startup gain or bypass the storage constraint.
+
+Official9/9, built-in3/3, 32 frozen seeds, eight full-word fixtures, exact
+emission, workspace/padding, six extra shapes and three alternate path
+depths pass. Generic paths retain their previous cycles. No leaderboard
+query or submission this iteration. Full evidence and rejected probes are
+preserved in `OPTIMIZATION_LOG.md` and `experiments/`.
+
+The implementation status below is historical.
+
 Latest accepted implementation: iteration 34, **969 cycles**, scratch
 **1,475**, parent `1d27efc`. Fuse encoding into the 48 scalar copies that
 already transpose the runtime records. This deletes six setup vector XORs

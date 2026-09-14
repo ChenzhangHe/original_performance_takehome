@@ -13,9 +13,11 @@ from tune_kernel import check
 from verify_kernel import verify_emission
 
 
-def make_module(zero_war=False, base_layout=False):
-    source = subprocess.run(['git', 'show', '1d27efc:perf_takehome.py'], cwd=REPO,
-                            check=True, capture_output=True, text=True).stdout
+def make_module(zero_war=False, base_layout=False, source_ref='1d27efc'):
+    # Keep the historical default; allow an explicit updated-graph retest.
+    source = ((REPO / 'perf_takehome.py').read_text() if source_ref == 'working-tree'
+              else subprocess.run(['git', 'show', f'{source_ref}:perf_takehome.py'], cwd=REPO,
+                                  check=True, capture_output=True, text=True).stdout)
     baseline = source
     def replace(old, new):
         nonlocal source
@@ -162,8 +164,9 @@ def main():
     parser.add_argument('--zero-war', action='store_true')
     parser.add_argument('--base-layout', action='store_true')
     parser.add_argument('--read-banks', type=int, default=4)
+    parser.add_argument('--source-ref', default='1d27efc')
     args = parser.parse_args()
-    m = make_module(args.zero_war, args.base_layout)
+    m = make_module(args.zero_war, args.base_layout, args.source_ref)
     m.BLOCKED_FINAL_CACHE_CHUNKS = args.final_cache
     m.HASH_ALU_CHUNKS = args.hash_alu
     m.BLOCKED_READ_BANKS = args.read_banks
@@ -179,7 +182,7 @@ def main():
     slots = Counter()
     for bundle in b.instrs:
         slots.update({e:len(v) for e,v in bundle.items()})
-    print(json.dumps(dict(final_cache=args.final_cache, hash_alu=args.hash_alu, zero_war=args.zero_war,
+    print(json.dumps(dict(source_ref=args.source_ref, final_cache=args.final_cache, hash_alu=args.hash_alu, zero_war=args.zero_war,
                           base_layout=args.base_layout, read_banks=args.read_banks,
                           cycles=len(b.instrs), scratch=b.scratch_ptr, slots=slots,
                           weighted=slots['valu']+slots['alu']/8, policy=b.schedule_policy)))

@@ -64,6 +64,24 @@ def verify_words(builder, label, tree_words, input_words):
     assert machine.cycle == len(builder.instrs)
 
 
+def verify_analysis(builder, report):
+    """Deferred setup remains setup, even when its priority round is > 0."""
+    pre_round_slots = Counter()
+    lookup_slots = 0
+    for i, op in enumerate(builder.operations):
+        # Round -1 also contains each group's initial input-value vload.
+        if op.get("is_setup", False) or op["round"] == -1:
+            engine = "alu" if i in builder.offloaded_ops else op["engine"]
+            pre_round_slots[engine] += len(builder.lane_issue_cycles.get(i, [builder.issue_cycles[i]]))
+        elif (op["round"] > 0 and op["engine"] == "load"
+              and op["slot"][0] in ("load_offset", "vload")):
+            lookup_slots += 1
+    assert {e: item["slots"] for e, item in report["rounds"][-1].items()} == dict(pre_round_slots)
+    assert report["lookup_load"]["slots"] == lookup_slots
+    if builder.blocked_setup_deadlines:
+        assert any(op.get("is_setup", False) and op["round"] > 0 for op in builder.operations)
+
+
 def verify_extra_shapes():
     results = []
     for height, rounds, batch in ((3, 5, 32), (4, 7, 64), (6, 11, 128),
@@ -110,10 +128,11 @@ def main():
                      [rng.getrandbits(32) for _ in range(2047)],
                      [rng.getrandbits(32) for _ in range(256)])
     report = analyze(builder)
+    verify_analysis(builder, report)
     report.pop("rounds")
     if args.extra_shapes:
         report["extra_shape_checks"] = verify_extra_shapes()
-    print(json.dumps(dict(schedule_emission="pass", random_seeds=32,
+    print(json.dumps(dict(schedule_emission="pass", setup_accounting="pass", random_seeds=32,
                           full_word_fixtures=8, **report), indent=2))
 
 

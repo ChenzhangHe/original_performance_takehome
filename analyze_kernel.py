@@ -31,11 +31,14 @@ def analyze(builder):
         lane_times = builder.lane_issue_cycles.get(i, [issued[i]])
         counts[engine] += len(lane_times)
         waits[engine].extend(t - ready for t in lane_times)
-        by_round[op["round"]][engine].extend(lane_times)
+        # Scheduling deadlines are not execution semantics. In particular,
+        # deferred setup vloads must not look like body node lookups.
+        semantic_round = -1 if op.get("is_setup", False) else op["round"]
+        by_round[semantic_round][engine].extend(lane_times)
         if engine == "load" and op["slot"][0] == "load_offset":
             gathers.append(issued[i])
         if (engine == "load" and op["slot"][0] in ("load_offset", "vload")
-                and op["round"] > 0):
+                and semantic_round > 0):
             lookup_loads.append(issued[i])
     engines = {}
     for engine, count in counts.items():
@@ -62,6 +65,9 @@ def analyze(builder):
         "workspace_layout": builder.workspace_layout,
         "blocked_lookup": builder.blocked_lookup,
         "blocked_setup_xor_fused": builder.blocked_setup_xor_fused,
+        "blocked_setup_deadlines": builder.blocked_setup_deadlines,
+        "blocked_early_tail_select": builder.blocked_early_tail_select,
+        "blocked_unused_weight_pruned": builder.blocked_unused_weight_pruned,
         "direct_gather_addresses": builder.direct_gather_addresses,
         "engines": engines,
         "gather": {

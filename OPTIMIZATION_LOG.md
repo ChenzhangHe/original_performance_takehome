@@ -2136,3 +2136,141 @@ that reduces BOTH work and the live/readiness cost. Repeating the same
 direct-child or larger-depth cache variants is not a justified plan. There
 are still69 elapsed cycles to900; this iteration establishes no complete
 route. No leaderboard lookup or external benchmark submission was performed.
+
+## Iteration 35 — restore startup readiness, then reorder the tail
+
+Date: 2026-09-13 (PDT). Parent `468f713`. Accepted **955 cycles**, scratch
+**1,459/1,536**. Versus969: **-14 cycles (-1.44%)**, -16 scratch words,
+but only **one** compute equivalent and one load removed. Most of the gain
+comes from readiness, not less body work.
+
+### Insight 1: initialization inherits a use deadline, not blanket urgency
+
+The non-blocked preencoding path already called
+`prioritize_setup_by_first_use`. The blocked path set `preencode=False`,
+so it skipped that call and left all setup at round-1/cohort32. Even the
+coefficients used only in the final round competed with early work. Reverse
+propagation through the existing DAG supplies the first consuming round;
+cap its scheduling priority at round4. No operations or dependencies change
+in this probe. **969 -> 960**, and first combined lookup **67 -> 54**.
+
+Use an explicit setup-prefix boundary, adjusted for pruned constants. Keep
+an immutable `is_setup` tag for analysis rather than treating the scheduling
+round as semantic identity. Otherwise setup vloads retagged to positive
+rounds would be incorrectly counted as node lookups. `verify_analysis`
+checks pre-round slot accounting (setup plus initial input loads) and
+combined lookup count independently of priority. The old fallback setup
+semantics are tagged too; its schedule is unchanged.
+
+### Insight 2: early bits help only when the graph can exploit them
+
+The final cached depth-4 lookup has14 selects and one MAC. The old coefficient
+tree began with p2, which arrives after p0/p1. Reverse its three-bit table
+coordinate and build four quartets using p0 then p1; select their slope and
+intercept using p2, then do the existing MAC when p3 arrives. Temporary
+quartets use the already allocated virtual-node region and are lifetime
+colored normally. No extra select, MAC or relaxed dependency is introduced.
+
+On the old initialization schedule this ties969; with setup deadlines it
+improves960 ->959. This is not a generally faster tree independent of context.
+
+### Insight 3: remove a vestigial weight, then measure the whole schedule
+
+The blocked address accumulation always first gathers at depth4 (or skips
+the final gather). Depth1 uses -16, depth2 uses -8, and the dedicated depth3
+step uses -4. The generated -32 scalar load and broadcast have no body
+consumer. Conservative constant DCE cannot delete the scalar because its
+own unused broadcast reads it. Omit this unused pair specifically on the
+blocked path; do not broaden DCE or remove fallback weights.
+
+This deletes one load and one VALU equivalent. Alone it regresses969 ->971;
+with setup deadlines it gives959; with deadlines AND the early tree it
+gives **955**. Less aggregate work does not imply fewer elapsed cycles.
+
+### Complete causal A/B
+
+All rows use the same four record read banks, seven final cached groups,
+fused setup/parent XORs and unchanged scheduler-policy candidates. Every
+row passes seeds123/456/789. Flags are independently reversible.
+
+| Setup deadlines | Early tail tree | Drop unused weight | Cycles | Scratch | Weighted compute |
+| --- | --- | --- | ---: | ---: | ---: |
+| off | off | off | 969 | 1,475 | 6,932 |
+| off | off | on | 971 | 1,451 | 6,931 |
+| off | on | off | 969 | 1,435 | 6,932 |
+| off | on | on | 975 | 1,427 | 6,931 |
+| on | off | off | 960 | 1,499 | 6,932 |
+| on | off | on | 959 | 1,475 | 6,931 |
+| on | on | off | 959 | 1,499 | 6,932 |
+| on | on | on | **955** | **1,459** | **6,931** |
+
+Accepted slots: load1,826, VALU5,604, ALU10,616, flow891, store40. Relative
+to969 this is -27 VALU/+208 ALU (-1 net equivalent), -1 load; the selected
+policy is still `fragment_adaptive_tail_hetero_360_220_140_140_900`.
+Offloaded385, fragmented253, maximum fragment span10; conservative DCE
+still prunes11 constants, in addition to the omitted weight at generation.
+Weighted compute6,931 leaves optimistic floor925 and necessary900 deficits
+of181 compute equivalents and26 loads. Flow has only nine spare slots.
+
+Body lookup count is unchanged:256 record vloads +1,480 narrow gathers.
+Combined first/last **54/944**, drain10, conditional finish bound922.
+Narrow gathers alone start80; they must not stand in for all lookup traffic.
+The runtime records still contain48 encoded nodes and16 padding zeros in64
+index words; remaining192 index words, forest and header remain untouched.
+
+### Bounded rejected/tied probes
+
+These are pinned to969 in `experiments/iteration35_setup_deadlines.py`.
+Feasible rows pass three seeds and exact emission; scratch overflows have
+no valid cycle result and never use a relaxed simulator limit.
+
+| Variant | Cycles | Scratch |
+| --- | ---: | ---: |
+| Deadlines only, cap3/4/5 | 960 | 1,499 |
+| Deadlines only, inherit highest consuming cohort | 960 | 1,491 |
+| Deadlines only, parent hash no longer waits for child copies | 960 | 1,499 |
+| Deadlines only, cap15 | rejected | 1,603 required |
+| All accepted changes, cap6 | 955 | 1,459 |
+| All accepted changes, cap10 | 960 | 1,515 |
+| All accepted changes, cap15 | rejected | 1,595 required |
+| All accepted changes, inherit consuming cohort | 959 | 1,499 |
+| All accepted changes, final cache6 | 962 | 1,459 |
+| All accepted changes, final cache8 | 961 | 1,459 |
+
+The cache8 row has load1,818, work6,929 and flow904: cheaper load/compute,
+but already beyond the900 flow budget. The parent/child-overlap dependency
+relaxation did not improve the deadline-only graph, so it is not integrated.
+
+Retest the earlier direct-child landing idea on the **new955 graph**, not
+just its old970 parent. Strict WAR gives **963**, scratch1,467; same-cycle
+WAR gives **961**, scratch1,531. Both have load1,828, weighted work6,901,
+flow891/store40 and pass three seeds plus emission. The net30-equivalent
+saving still loses to the load/read-buffer serialization. No speculative
+allocator or same-cycle scheduler enters the accepted kernel. The existing
+probe now accepts an explicit `--source-ref` while preserving its pinned
+1d27efc default.
+
+### Acceptance and reproduction
+
+Official9/9 and built-in3/3 pass at955. Full local acceptance passes32 frozen
+seeds, eight full-32-bit fixtures, exact primitive reconstruction, dependency
+and capacity checks, setup accounting, exact workspace/padding and untouched
+memory. Six extra shapes and path depths0/2/3 each retain their old cycle
+counts across three seeds. No official test/simulator changes.
+
+```sh
+python3 tune_kernel.py --blocked-setup-deadlines 0 1 --blocked-early-tail-select 0 1 --blocked-drop-unused-weight 0 1 --seeds 123 456 789
+python3 tests/submission_tests.py
+python3 perf_takehome.py
+python3 verify_kernel.py --extra-shapes
+python3 experiments/iteration35_setup_deadlines.py --early-tail --drop-weight
+python3 experiments/iteration35_setup_deadlines.py --early-tail --drop-weight --cap 15
+# On the clean iteration35 checkout; default source remains the old970 graph:
+python3 experiments/iteration34_child_landing.py --source-ref working-tree
+python3 experiments/iteration34_child_landing.py --source-ref working-tree --zero-war
+```
+
+Next require a body-work reduction that preserves parallel load readiness.
+The smaller startup does not close the aggregate181-compute/26-load deficit.
+There are55 elapsed cycles to900, not a validated complete route. No
+leaderboard query or external submission was performed in this iteration.
