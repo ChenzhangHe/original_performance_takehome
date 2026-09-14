@@ -59,11 +59,12 @@ def main():
         "BLOCKED_FUSE_PARENT_XOR",
         "BLOCKED_FUSE_SETUP_XOR",
         "BLOCKED_SETUP_DEADLINES", "BLOCKED_EARLY_TAIL_SELECT", "BLOCKED_DROP_UNUSED_WEIGHT",
+        "BLOCKED_ENCODE_DEPTH6", "BLOCKED_REVERSE_INPUT_CHAIN_LENGTH", "BLOCKED_TAIL_START",
     ):
         parser.add_argument("--" + name.lower().replace("_", "-"), type=int, nargs="+", default=[getattr(kernel, name)])
     parser.add_argument("--seeds", type=int, nargs="+", default=[123])
     args = parser.parse_args()
-    for hash_chunks, bit_mask_chunks, path_depth, cache_chunks, direct_depth, backlog, reserve_start, final_cache_chunks, address_chain, preencode_depth, input_priority, fragment_issue, direct_addresses, blocked, read_banks, blocked_final_cache, fuse_parent, fuse_setup, setup_deadlines, early_tail, drop_weight in product(
+    for hash_chunks, bit_mask_chunks, path_depth, cache_chunks, direct_depth, backlog, reserve_start, final_cache_chunks, address_chain, preencode_depth, input_priority, fragment_issue, direct_addresses, blocked, read_banks, blocked_final_cache, fuse_parent, fuse_setup, setup_deadlines, early_tail, drop_weight, encode_depth6, reverse_chain, tail_start in product(
         args.hash_alu_chunks, args.bit_mask_valu_chunks, args.path_reuse_depth,
         args.depth4_cache_chunks, args.direct_path_depth, args.alu_vector_backlog,
         args.alu_vector_reserve_start,
@@ -76,6 +77,7 @@ def main():
         args.blocked_fuse_parent_xor,
         args.blocked_fuse_setup_xor,
         args.blocked_setup_deadlines, args.blocked_early_tail_select, args.blocked_drop_unused_weight,
+        args.blocked_encode_depth6, args.blocked_reverse_input_chain_length, args.blocked_tail_start,
     ):
         kernel.HASH_ALU_CHUNKS = hash_chunks
         kernel.BIT_MASK_VALU_CHUNKS = bit_mask_chunks
@@ -98,6 +100,9 @@ def main():
         kernel.BLOCKED_SETUP_DEADLINES = bool(setup_deadlines)
         kernel.BLOCKED_EARLY_TAIL_SELECT = bool(early_tail)
         kernel.BLOCKED_DROP_UNUSED_WEIGHT = bool(drop_weight)
+        kernel.BLOCKED_ENCODE_DEPTH6 = bool(encode_depth6)
+        kernel.BLOCKED_REVERSE_INPUT_CHAIN_LENGTH = reverse_chain
+        kernel.BLOCKED_TAIL_START = tail_start
         start = time.perf_counter()
         builder = kernel.KernelBuilder()
         builder.build_kernel(10, 2047, 256, 16)
@@ -126,6 +131,9 @@ def main():
                               blocked_setup_deadlines=builder.blocked_setup_deadlines,
                               blocked_early_tail_select=builder.blocked_early_tail_select,
                               blocked_unused_weight_pruned=builder.blocked_unused_weight_pruned,
+                              blocked_encode_depth6=builder.blocked_encode_depth6,
+                              blocked_reverse_input_chain_length=builder.blocked_reverse_input_chain_length,
+                              blocked_tail_start=tail_start,
                               cycles=cycles, scratch=builder.scratch_ptr, policy=builder.schedule_policy,
                               slots=dict(slots), checked_seeds=args.seeds, build_seconds=round(elapsed, 3))), flush=True)
 

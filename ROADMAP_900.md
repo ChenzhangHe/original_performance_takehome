@@ -1,5 +1,50 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 36, **954 cycles**, scratch
+**1,477**, parent `3d24666`. This is only **one cycle** faster than955.
+Runtime-encode the64 depth-6 nodes after the existing64-word record table;
+fold entry/exit rebasing into the existing address biases. Four-address
+descending chains remove eight constant loads, and initial input loads
+carry round-0 priority. On this cheaper graph, a later drain phase at920
+instead of900 saves the elapsed cycle; the old policies remain candidates.
+
+Slots: load **1,829**, VALU **5,599**, ALU **10,494**, flow **891**, store
+**48**. Weighted compute **6,910.75**, optimistic compute floor **922**.
+Versus955: **-20.25 compute equivalents, +3 loads, +8 stores, +18 scratch**.
+Necessary900 deficits are now **160.75 compute equivalents and29 loads**;
+flow still has only nine spare slots. This improves the compute budget but
+worsens the aggregate load budget slightly. There are **54 cycles** to900,
+not a demonstrated complete route.
+
+The workspace is128 index words:48 record nodes,16 padding zeros and64
+contiguous depth-6 nodes. The remaining128 index words, header and forest
+are untouched. Record gathers wait only for record stores; depth-6 gathers
+wait for their own copy stores. Combined lookup count remains1,736,
+first/last **53/943**, drain10, conditional finish bound921.
+
+The larger reductions did not win: two/four independent child-landing
+chains still take961/957 on the old955 graph, even without changing record
+order. Deeper6/7 encoding takes963; using flow selects to remove32 deep
+index subtractions takes976 despite31 fewer compute equivalents. Moving
+the node XOR off the gather dependency chain also regresses. See the full
+tables and six pinned reproduction scripts in iteration36 of the log.
+
+Next require a costed body-level change, including its new dependencies,
+not just fewer instructions. More final caches, longer address chains,
+same-cycle WAR and earlier decoding have now been rechecked on955. Do not
+repeat them unchanged. Another packed two-level record layout needs an
+explicit copy/merge, flow, address and live-storage budget before coding;
+remaining workspace alone is not evidence it will help. Keep the cheaper
+depth-6 graph as an A/B control when studying load/compute balance.
+
+Official9/9, built-in3/3, 32 frozen seeds, eight full-word fixtures,
+emission/capacity/dependency checks and all extra shapes pass. Reproduce
+955 with `--blocked-encode-depth6 0 --blocked-reverse-input-chain-length 0
+--blocked-tail-start 900`; defaults give954. No test/simulator change,
+leaderboard query or external benchmark submission this iteration.
+
+The implementation status below is historical.
+
 Latest accepted implementation: iteration 35, **955 cycles**, scratch
 **1,459**, parent `468f713`. This is **14 cycles faster** than 969. Enable
 consumer-round setup priorities on the blocked graph, order the final

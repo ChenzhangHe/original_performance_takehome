@@ -2274,3 +2274,187 @@ Next require a body-work reduction that preserves parallel load readiness.
 The smaller startup does not close the aggregate181-compute/26-load deficit.
 There are55 elapsed cycles to900, not a validated complete route. No
 leaderboard query or external submission was performed in this iteration.
+
+## Iteration 36 — reduce depth-6 encoding work; one elapsed cycle gained
+
+Date: 2026-09-13 (PDT). Parent `3d24666`. Accepted **954 cycles**, scratch
+**1,477/1,536**. The larger body experiments did not beat955. The accepted
+combination deletes20.25 compute equivalents but improves elapsed time by
+only **one cycle (0.105%)**. Do not characterize this as breaking the900
+barrier or as a large scheduling gain.
+
+### Accepted: one deeper encoded level, shorter load setup, later drain
+
+Append a runtime XOR-C copy of nodes63..126 (depth6) to the existing64-word
+record workspace. Eight vector loads/XORs/stores replace256 scalar node
+XORs in the32 depth-6 groups. Two source buffers retain normal inferred
+RAW/WAR hazards. The record and depth-6 store barriers are separate: forcing
+depth4 to wait for unrelated deeper copies would squander startup overlap.
+
+For the copy, `delta=n_nodes+1=2048`. Modify the existing record exit bias
+from `73-W` to `73-W+delta`, so depth6 already holds the copied address.
+Then use `-5-2*delta` in the existing affine index update to return to the
+original depth-7 forest. No extra per-gather conversion is emitted. Since
+only one level is copied, no within-copy transition bias is needed.
+
+This alone removes21.25 compute equivalents, adds11 loads/eight stores,
+and ties955. Change input-address generation from16 forward two-address
+chains to eight descending four-address chains: anchor the highest group
+in each chain, derive lower addresses by subtracting8, and give the input
+vloads their consuming root round0 metadata. This removes eight more load
+slots at a cost of eight ALU additions/subtractions (one equivalent). It
+also advances the first combined lookup54 ->53, but alone still ties955.
+The forward/generic path remains unchanged, including its chain-length
+control; the blocked reverse chain has its own zero-to-disable switch.
+
+Finally, compare drain-phase start920 with900 on the changed graph. The
+new phase saves one cycle only with depth-6 encoding enabled. Production
+retains every original policy, adding the later phase as another bounded
+candidate; no instructions or dependencies are relaxed. The chosen policy
+is `fragment_adaptive_tail_hetero_360_220_140_140_920`.
+
+### Complete accepted A/B
+
+All eight rows pass frozen seeds123/456/789. The tail setting adds a policy,
+not a mandate to use it; unchanged graphs retain the earlier winner on ties.
+
+| Depth-6 copy | Reverse chain length | Added tail phase | Cycles | Loads | Weighted compute | Scratch |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| off | 0 | 900 | 955 | 1,826 | 6,931 | 1,459 |
+| off | 0 | 920 | 955 | 1,826 | 6,931 | 1,459 |
+| off | 4 | 900 | 955 | 1,818 | 6,932 | 1,459 |
+| off | 4 | 920 | 955 | 1,818 | 6,932 | 1,459 |
+| on | 0 | 900 | 955 | 1,837 | 6,909.75 | 1,477 |
+| on | 0 | 920 | 954 | 1,837 | 6,909.75 | 1,477 |
+| on | 4 | 900 | 955 | 1,829 | 6,910.75 | 1,477 |
+| on | 4 | 920 | **954** | **1,829** | **6,910.75** | **1,477** |
+
+Accepted slots: load1,829, VALU5,599, ALU10,494, flow891, store48. Versus
+955: -5 VALU/-122 ALU, +3 loads, +8 stores and +18 scratch. The256 removed
+node XORs are partly offset by nine vector setup operations,14 pointer
+updates and eight extra address-chain ALU operations; adaptive offloading
+also changes the split. Net work is `-5-122/8=-20.25` equivalents.
+
+Optimistic combined compute floor drops925 ->922. Necessary900 deficits
+become160.75 compute equivalents and29 loads (the load deficit worsens by3).
+Per-engine floors are load915, VALU934, ALU875, flow891, store24. None is a
+proof that other algorithms cannot reach900. Fifty-four elapsed cycles remain.
+
+Body lookup traffic remains256 record vloads +1,480 scalar gathers. Combined
+first/last53/943, drain10, conditional finish bound921; narrow gathers start80.
+Offloaded399, fragmented274, maximum fragment span31 (up from10), with exact
+emission/dependency and full-memory checks passing. Pruned constants remain11.
+The128-word workspace contains112 encoded nodes plus16 padding zeros; the
+remaining128 index words and entire forest/header remain unchanged.
+
+### Rejected body experiment A: independent child-landing chains
+
+Split the earlier left-child landing span into two or four independent
+chains, merging only the left lanes from non-primary banks. Each bank is
+protected as an atomic contiguous16-word interval in the PROBE allocator.
+Secondary left copies wait for the primary bank's old readers as well as
+their source load. Strict dependencies remain unless the explicitly named
+same-cycle WAR probe is enabled.
+
+With two or more interleaved banks, keep the original `[parent,left,right,0]`
+record order: place left lane0 at buffer offset1 and space successive loads
+in a bank by at least two words. This preserves previous left values while
+avoiding two tail-address constants. The unaligned left-vector read is
+included in the full contiguous allocation span. This is a valid lower-work
+layout, but its merging and overwrite dependencies still cost too much.
+
+| Banks / layout / dependency rule | Cycles | Scratch | Loads | Weighted compute |
+| --- | ---: | ---: | ---: | ---: |
+| 1 / left-first / strict (control) | 963 | 1,467 | 1,828 | 6,901 |
+| 2 / left-first / strict | 961 | 1,491 | 1,828 | 6,917 |
+| 2 / left-first / same-cycle WAR | 959 | 1,491 | 1,828 | 6,917 |
+| 2 / left-first / contiguous lane partitions | 961 | 1,491 | 1,828 | 6,917 |
+| 4 / left-first / strict | 957 | 1,515 | 1,828 | 6,925 |
+| 2 / original record order / strict | 961 | 1,483 | 1,826 | 6,915 |
+| 4 / original record order / strict | 957 | 1,515 | 1,826 | 6,923 |
+| 4 / original record order / same-cycle WAR | 959 | 1,523 | 1,826 | 6,923 |
+| 4 / original order / strict / final cache6 | 960 | 1,515 | 1,834 | 6,925 |
+
+All rows pass three seeds and primitive emission. On the UNCHANGED955 layout,
+same-cycle WAR with two/four read banks both takes960, so that mechanism is
+also rejected independently. No new allocator or same-cycle dependencies
+enter the production kernel. See `iteration36_banked_landing.py` and the
+existing iteration34 probe with `--source-ref 3d24666 --base-layout --zero-war`.
+
+### Rejected body experiment B: broader encoding and changed index arithmetic
+
+| Extra encoded levels / setup variant (forward chains, tail900) | Cycles | Scratch | Loads | Weighted compute |
+| --- | ---: | ---: | ---: | ---: |
+| depth6, including an unused within-copy bias | 956 | 1,509 | 1,838 | 6,910.75 |
+| depth6, unused bias omitted | 955 | 1,477 | 1,837 | 6,909.75 |
+| depth6, reuse the record-input buffers | 958 | 1,501 | 1,837 | 6,909.75 |
+| depth6, one buffer instead of two | 955 | 1,477 | 1,837 | 6,909.75 |
+| depth6, setup deadline cap6 | 955 | 1,477 | 1,837 | 6,909.75 |
+| depths6/7, full remaining workspace | 963 | 1,533 | 1,854 | 6,898.75 |
+| depth7 only, unused bias omitted | 958 | 1,477 | 1,846 | 6,920.75 |
+
+The depth7-only prototype retaining the unused bias FAILED seed123. No cycle
+result is accepted for it; its failure is preserved as a correctness rejection
+in the probe, not silently treated as a valid slower row. The omitted-bias
+variant passes three seeds, one full-word workspace fixture and a traced
+check of each node lookup's expected address/value. It is still slower than955
+and was not integrated. This rejection is not a claim that its cause has
+been fully diagnosed.
+
+With the valid depth6 copy, final cache8/9/10 gives962/969/974, with flow
+904/917/930. More cache is again rejected. On the depth6+reverse-chain graph,
+probe tail starts860/880/900/920/940 give960/960/955/954/955. These probes
+replace one candidate policy; production adds920 while retaining900.
+
+Use parity to select a vector bias -6/-5, then do a single index MAC, instead
+of preparing2*A-5 and subtracting parity. Across one deep level this removes
+32 vector-equivalent subtractions, with one new bias broadcast: net -31
+compute equivalents, but +32 flow slots and +1 load. The final MAC now waits
+for the parity AND bias select. Depth6 or depth9 across32 groups both takes
+976 (flow923, work6,900). Restricting depth9 to eight groups takes960,
+flow899, work6,924. Even spare aggregate flow capacity does not make those
+new dependent selects free. See `iteration36_index_select.py`.
+
+### Other bounded readiness probes
+
+- Move XOR-C from the gathered raw node onto the previous encoded input value,
+  after previous parity readers, but independently of the current load. This
+  shortens the gather-to-input-XOR chain without changing total work. Across
+  depths6..10 it takes958 with adaptive vector XOR or957 with scalar XOR.
+  Depth10 only takes958 for either; depths9..10 take958; depth6 only takes959.
+  No early-decode change is accepted (`iteration36_early_decode.py`).
+- Fuse the raw-root encoding with its required copy: one fewer ALU operation,
+  but still955. Let root XORs adapt between vector/scalar engines: first
+  traversal only957, both traversals960 (with root-copy fusion). Rejected.
+- Four FORWARD address chains:963, load1,818. Reverse four-address chains:
+  958 with old pre-round input priority,955 with round0 priority. Reverse
+  two-address chains take959. Reverse eight-address chains plus round0 take
+  958, despite load1,814. Input round0 alone ties955. Only the costed four-step
+  reverse version is accepted in combination with deeper encoding.
+
+### Acceptance, reproducibility and next direction
+
+Official9/9, built-in3/3, 32 frozen seeds, eight full-word fixtures, exact
+emission, strict dependency/capacity checks, setup accounting and workspace
+boundaries pass at954. The six extra shapes and three alternate path depths
+each retain their previous cycle counts across three seeds. Tests and
+simulators are unchanged. Six iteration36 scripts pin their source to955
+and report valid timings only after frozen checks; they are not imported
+by the production kernel.
+
+```sh
+python3 tune_kernel.py --blocked-encode-depth6 0 1 --blocked-reverse-input-chain-length 0 4 --blocked-tail-start 900 920 --seeds 123 456 789
+python3 tests/submission_tests.py
+python3 perf_takehome.py
+python3 verify_kernel.py --extra-shapes
+python3 experiments/iteration36_banked_landing.py --banks 4 --original-order
+python3 experiments/iteration36_extra_encoding.py --first 6 --last 6 --drop-unused-bias --reverse-chains --tail-start 920
+python3 experiments/iteration36_index_select.py --depth 9 --groups 8
+```
+
+Next demand both a full work budget and a readiness argument for another
+body transformation. A compressed two-level record is only a hypothesis:
+count any extra address MAC, merge/copy, flow and live scratch before treating
+fewer gathers as progress. Do not repeat the rejected bank, extra-cache,
+early-decode or index-select variants unchanged. No leaderboard query or
+external benchmark submission this iteration.

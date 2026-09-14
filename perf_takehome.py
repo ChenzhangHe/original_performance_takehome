@@ -66,6 +66,9 @@ BLOCKED_FUSE_SETUP_XOR = True
 BLOCKED_SETUP_DEADLINES = True
 BLOCKED_EARLY_TAIL_SELECT = True
 BLOCKED_DROP_UNUSED_WEIGHT = True
+BLOCKED_ENCODE_DEPTH6 = True
+BLOCKED_REVERSE_INPUT_CHAIN_LENGTH = 4  # Zero retains the original forward chains.
+BLOCKED_TAIL_START = 920
 
 
 class KernelBuilder:
@@ -431,6 +434,10 @@ class KernelBuilder:
             "adaptive_tail_hetero_360_220_220_140_750",
             "adaptive_tail_hetero_480_300_140_220_750",
         )
+        if getattr(self, "blocked_lookup", False):
+            # Retain all old policies; compare the later drain phase on the
+            # graph with less deep-node encoding and fewer address loads.
+            policies += (f"adaptive_tail_hetero_360_220_140_140_{BLOCKED_TAIL_START}",)
         # Keep the existing policies as fallbacks; compare a bounded set of
         # reservation-aware tail policies on the changed operation graph.
         policies += tuple("balanced_" + p for p in policies if p.startswith("adaptive_tail_"))
@@ -525,6 +532,9 @@ class KernelBuilder:
         self.blocked_setup_deadlines = blocked_lookup and BLOCKED_SETUP_DEADLINES
         self.blocked_early_tail_select = blocked_lookup and BLOCKED_EARLY_TAIL_SELECT
         self.blocked_unused_weight_pruned = blocked_lookup and BLOCKED_DROP_UNUSED_WEIGHT
+        self.blocked_encode_depth6 = blocked_lookup and BLOCKED_ENCODE_DEPTH6
+        assert BLOCKED_REVERSE_INPUT_CHAIN_LENGTH >= 0
+        self.blocked_reverse_input_chain_length = BLOCKED_REVERSE_INPUT_CHAIN_LENGTH if blocked_lookup else 0
         assert BLOCKED_READ_BANKS in (1, 2, 4, 8)
         assert not blocked_lookup or 0 <= BLOCKED_FINAL_CACHE_CHUNKS <= chunk_count
         self.fragment_alu_enabled = scored_shape and ALU_FRAGMENT_ISSUE
@@ -779,6 +789,7 @@ class KernelBuilder:
             if preencode:
                 direct_vectors.extend((thirty_two, copied_bias, five_vector, exiting_bias))
 
+        extra_encode_buffers = []
         if blocked_lookup:
             # Transpose the runtime depth-4/5 values into 16 four-word records:
             # [encoded parent, encoded left child, encoded right child, zero].
@@ -811,9 +822,12 @@ class KernelBuilder:
                     self.add("store", ("vstore", block_store_addr, block_output))
                     if parent_start != 8 or pair != 3:
                         self.add("alu", ("+", block_store_addr, block_store_addr, address_step))
-            # Record address B=4*A4+block_base-88. The depth-6 address is
+            # Record address B=4*A4+block_base-88. The original depth-6 address is
             # A6=B+(73-block_base)-2*p4-p5, where encoded parity is inverted.
-            block_exit_bias = vector_const((73-block_base) & 0xFFFFFFFF, "block_exit_bias")
+            # An optional contiguous depth-6 copy follows the 64 record words.
+            # Its address offset is n_nodes+1; fold entry into this existing bias.
+            extra_delta = n_nodes + 1 if self.blocked_encode_depth6 else 0
+            block_exit_bias = vector_const((73-block_base+extra_delta) & 0xFFFFFFFF, "block_exit_bias")
             block_neg4 = negative_weights[2]
             # Every blocked group first gathers at depth 4 (or has no final
             # gather). Only depth-1/2 accumulation needs weights -16/-8;
@@ -828,6 +842,27 @@ class KernelBuilder:
             self.workspace_node_indices = [index for parent in range(15, 31)
                                            for index in (parent, 2*parent+1, 2*parent+2, None)]
             self.workspace_layout = "parent_children_stride4"
+            if self.blocked_encode_depth6:
+                self.preencoded_node_count += 64
+                self.workspace_node_indices.extend(range(63, 127))
+                self.workspace_layout = "parent_children_stride4_plus_depth6"
+                # A6 is copied A+delta, but A7 is back in the original tree:
+                # A7=2*A6-5-2*delta-p. No per-gather address conversion is added.
+                extra_exit_bias = vector_const((-5-2*extra_delta) & 0xFFFFFFFF, "extra_exit_bias")
+                direct_vectors.append(extra_exit_bias)
+                extra_encode_buffers = [self.alloc_scratch(f"extra_buffer_{i}", VLEN) for i in range(2)]
+                extra_src = self.alloc_scratch("extra_src")
+                extra_dst = self.alloc_scratch("extra_dst")
+                self.add("load", ("const", extra_src, forest_values_p+63))
+                self.add("load", ("const", extra_dst, block_base+64))
+                for vector_no in range(64 // VLEN):
+                    buffer = extra_encode_buffers[vector_no % len(extra_encode_buffers)]
+                    self.add("load", ("vload", buffer, extra_src))
+                    self.add("valu", ("^", buffer, buffer, final_xor_vec))
+                    self.add("store", ("vstore", extra_dst, buffer))
+                    if vector_no != 64 // VLEN - 1:
+                        self.add("alu", ("+", extra_src, extra_src, address_step))
+                        self.add("alu", ("+", extra_dst, extra_dst, address_step))
 
         # Fold initialization into the same DAG as the kernel.  Main operations
         # gain dependencies on the setup instructions that produce their inputs.
@@ -849,6 +884,12 @@ class KernelBuilder:
         path_bits_base = tmp2 + batch_size
 
         block_stores = [i for i, op in enumerate(setup_ops) if op["engine"] == "store"] if blocked_lookup else []
+        extra_level_stores = []
+        if self.blocked_encode_depth6:
+            # Dynamic gathers require every store for THEIR level, not all
+            # preprocessing. Depth-4 records must not wait for depth-6 copying.
+            extra_level_stores, block_stores = block_stores[8:], block_stores[:8]
+            assert len(extra_level_stores) == 8
         block_children_base = path_bits_base + rounds * batch_size
         ops = setup_ops
         setup_count = len(setup_ops)
@@ -923,25 +964,32 @@ class KernelBuilder:
 
         # Keep these scalar addresses live through output stores, avoiding
         # a separate flow add_imm for each chunk at the end of execution.
-        # Default: one independent anchor per pair avoids a long address chain
-        # while replacing half of these load slots with scalar additions.
-        input_addr_ready = []
-        for chunk_no in range(chunk_count):
+        # Forward pairs retain the old path. The blocked variant anchors each
+        # short chain at its highest group, matching descending cohort priority;
+        # four-address chains replace eight more constant loads with ALU work.
+        reverse_inputs = self.blocked_reverse_input_chain_length > 0
+        chain_length = self.blocked_reverse_input_chain_length or INPUT_ADDRESS_CHAIN_LENGTH
+        input_addr_ready = [None] * chunk_count
+        input_order = range(chunk_count-1, -1, -1) if reverse_inputs else range(chunk_count)
+        for chunk_no in input_order:
             if scored_shape and INPUT_ADDRESS_CONSUMER_PRIORITY:
                 # This address feeds the group's root-round input load. Do
                 # not strand every anchor behind setup as a dummy cohort -1.
                 emit_context.update(chunk=chunk_no, round=0, local_seq=0)
-            if chunk_no % INPUT_ADDRESS_CHAIN_LENGTH == 0:
+            anchor = ((chunk_no == chunk_count-1 or (chunk_no+1) % chain_length == 0)
+                      if reverse_inputs else chunk_no % chain_length == 0)
+            if anchor:
                 ready = emit("load", ("const", input_addrs + chunk_no,
                                       inp_values_p + chunk_no * VLEN))
             else:
-                ready = emit("alu", ("+", input_addrs + chunk_no,
-                                     input_addrs + chunk_no - 1, address_step),
-                             input_addr_ready[-1])
-            input_addr_ready.append(ready)
+                neighbor = chunk_no + 1 if reverse_inputs else chunk_no - 1
+                ready = emit("alu", ("-" if reverse_inputs else "+", input_addrs + chunk_no,
+                                      input_addrs + neighbor, address_step),
+                             input_addr_ready[neighbor])
+            input_addr_ready[chunk_no] = ready
 
         for chunk_no in range(chunk_count):
-            emit_context.update(chunk=chunk_no, round=-1, local_seq=0)
+            emit_context.update(chunk=chunk_no, round=0 if reverse_inputs else -1, local_seq=0)
             offset = chunk_no * VLEN
             chunk_idx = idx + offset
             chunk_val = val + offset
@@ -1362,13 +1410,13 @@ class KernelBuilder:
                     val_ready = emit("valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected)
                     node_pool_uses.extend((dest, block_use_start, len(ops), 1) for dest in (block_left, block_right))
                 else:
-                    encoded_node = ((blocked_lookup and depth == 4)
+                    encoded_node = ((blocked_lookup and (depth == 4 or (self.blocked_encode_depth6 and depth == 6)))
                                     or (preencode and encode_first <= depth <= encode_last))
                     address_constant = encoded_address_five if preencode and encoded_node else address_five
                     # Rebase addresses without extra per-lane arithmetic.
                     # Dynamic gathers may read any node in their level, so
                     # every copy-store for that level must have committed.
-                    extra_ready = (block_stores if blocked_lookup and encoded_node else
+                    extra_ready = ((block_stores if depth == 4 else extra_level_stores) if blocked_lookup and encoded_node else
                                    [encoded_address_ready, *encoded_levels_ready[depth]] if encoded_node else [])
                     if positive_addresses:
                         node_loads = [
@@ -1418,6 +1466,8 @@ class KernelBuilder:
                     # when returning to the original forest address space.
                     bias = ((exiting_bias if depth == encode_last else copied_bias)
                             if preencode and encode_first <= depth <= encode_last else address_bias)
+                    if self.blocked_encode_depth6 and depth == 6:
+                        bias = extra_exit_bias
                     index_base_ready = emit(
                         "valu", ("multiply_add", chunk_idx, chunk_idx, two, bias), node_address_reads
                     )
@@ -1605,7 +1655,7 @@ class KernelBuilder:
         self.allocate_node_lifetimes(ops, node_pool_uses,
                                      tuple(depth4_vectors if cache_depth4 else ()) +
                                      tuple(direct_vectors if positive_addresses else ()) +
-                                     tuple([*block_input, block_output] if blocked_lookup else ()) + tuple(encode_buffers) +
+                                     tuple([*block_input, *extra_encode_buffers, block_output] if blocked_lookup else ()) + tuple(encode_buffers) +
                                      tuple(range(idx, idx + batch_size, VLEN)))
         for bundle in self.instrs:
             for engine in list(bundle):

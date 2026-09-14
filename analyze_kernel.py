@@ -68,6 +68,8 @@ def analyze(builder):
         "blocked_setup_deadlines": builder.blocked_setup_deadlines,
         "blocked_early_tail_select": builder.blocked_early_tail_select,
         "blocked_unused_weight_pruned": builder.blocked_unused_weight_pruned,
+        "blocked_encode_depth6": builder.blocked_encode_depth6,
+        "blocked_reverse_input_chain_length": builder.blocked_reverse_input_chain_length,
         "direct_gather_addresses": builder.direct_gather_addresses,
         "engines": engines,
         "gather": {
