@@ -2458,3 +2458,222 @@ count any extra address MAC, merge/copy, flow and live scratch before treating
 fewer gathers as progress. Do not repeat the rejected bank, extra-cache,
 early-decode or index-select variants unchanged. No leaderboard query or
 external benchmark submission this iteration.
+
+## Iteration 37 — compact deep records and lane-aware consumption (2026-09-13–14)
+
+**Accepted: 954 -> 941 cycles**, parent `2d5bc94`. This follows the ordered
+brainstorm: three-level records, state-encoding synthesis, lane-level
+consumers, then a routing cost screen. The first large record failed, but
+its accounting led to a different, successful compact two-level layout.
+No simulator, official test, reference output or generated input was changed.
+
+### 1. Three-level records: feasible storage is not cheap consumption
+
+The existing128-word workspace contains all112 nodes in depths4/5/6 plus16
+padding words. Repack them as16 records of eight words:
+`[parent,left,right,LL,LR,RL,RR,0]`. This removes256 depth6 gathers, but
+adds four child-copy vectors and three selects per group. The full graph
+has1,579 loads. No timing is inferred from a scratch-invalid schedule.
+Its exact compute work is7,006 equivalents and flow987, versus6,910.75
+and891 in the parent. The net load reduction is250, not256, after setup.
+
+| Three-level variant | Result | Scratch | Compute equivalents | Flow |
+| --- | ---: | ---: | ---: | ---: |
+| Ordinary selection, four read banks | scratch rejection | 1,611 | 7,006 | 987 |
+| Ordinary selection, one read bank | scratch rejection | 1,627 | 7,006 | 987 |
+| Two-group live-record window, two banks, two-policy screen | 1,038 | 1,507 | 7,006 | 987 |
+| Same bounded window, full policy set | 1,031 | 1,515 | 7,006 | 987 |
+| One-group window, one bank | 1,434 | 1,363 | 7,006 | 987 |
+| Bilinear coefficients, two banks, no window | scratch rejection | 1,891 | 7,110 | 891 |
+| Bilinear coefficients, two-group window | scratch rejection | 1,619 | 7,110 | 891 |
+| Bilinear coefficients, one-group window/one bank | 1,419 | 1,363 | 7,110 | 891 |
+
+Timed rows pass three frozen seeds, a full-word workspace fixture and
+exact emission. Windows impose real load dependencies; the scratch limit
+is never enlarged. The coefficient variant evaluates the four grandchildren
+using three MACs and no extra flow, but its copies/setup make it compute-heavy.
+Neither three-level variant enters production.
+
+### 2. Bounded state/hash synthesis: eight specific templates excluded
+
+`iteration37_state_search.py` uses optional `z3-solver==4.15.4.0` in an
+isolated environment. Production has no solver dependency. All expressions
+use32-bit bitvectors; an UNSAT set of sampled constraints rules out every
+parameter assignment in that named template, rather than merely testing
+a few handpicked constants. Any SAT candidate would require a separate
+full32-bit equivalence query before acceptance.
+
+All eight templates were UNSAT (26 initial input constraints sufficed):
+
+- Absorb the first constant XOR while granting a free arbitrary input XOR,
+  with fixed4097 multiplier, then with any odd32-bit multiplier.
+- Absorb the final multiply-by9 of the middle window into two affine XOR
+  arms, granting every pair of32-bit biases for each of the four signed
+  multiplier pairs `(±297, ±152064)`. This is broader than the old finite
+  bias enumeration, but still not an arbitrary-instruction search.
+- Two cross-round bridge templates, granting arbitrary XOR encoding and
+  affine coefficients at effective-node-zero, with output xor-shift16 or19.
+  Failing this required slice excludes those particular bridge templates.
+
+No formula was adopted. This is **not** a proof that ten hash instructions
+are optimal, nor an exhaustive search over state representations.
+
+### 3. Lane-level tail: no win alone, useful on a changed graph
+
+Make the terminal hash XOR eight explicit scalar producers. Each matching
+parity lane can depend on only its own producer; vector consumers still
+wait for every lane they read. This differs from ordinary fragment issue,
+whose consumers wait for the complete logical vector.
+
+On the pinned954 graph, depths5..9 remain954, using1,461 scratch with the
+two-policy screen or1,445 with all policies. Keeping the old whole-vector
+parity barrier ties954/1,477. Forcing the terminal SHIFT into scalar lanes
+as well regresses to981 (all groups) or973 (highest16 groups). Depths5/6
+alone give955, while7/8/9 tie954. Weighted work is unchanged throughout.
+Only the terminal-XOR/matching-parity mechanism is adopted on the new graph.
+
+### 4. Prefix grouping: reject costly routing implementations first
+
+The routing script is a cost model, not a kernel timing. For two payload
+words (value and packed prefix/original identity), four scalar-scatter radix
+passes plus final output restoration require2,304 scalar stores: at least
+1,152 store cycles before histogram/address work. A256-item bitonic network
+has4,608 comparators; its scalar-select implementation requires18,432 flow
+slots, or the masked two-word exchange variant46,080 ALU slots (floor3,840).
+These implementations cannot repay their routing cost by removing the old
+first traversal's1,536 lookup-load slots (768 load-engine cycles maximum).
+
+An optimistic one-scatter memory-counter scheme still has1,280 stores and
+512 counter loads, excluding initialization, prefix sums and addressing.
+Its workspace feasibility is unproven. Other grouping algorithms remain
+open. Three illustrated random fixtures have bucket sizes4..30, confirming
+why uniform bucket sizes cannot be baked into the algorithm.
+
+### Successful follow-up: two compact record tables, not one wider table
+
+Retain the64-word depth4/5 records. Replace the64-word linear depth6 copy
+with192 words of64 stride-3 depth6/7 records. This exactly fills the256-word
+index workspace. The initial deep layout is `[parent,left,right]`; the
+accepted final layout is `[left,parent,right]` for direct child landing.
+
+Let `W` be the workspace base, `A6` the original depth6 memory address and
+`B4` the original stride-4 record address. Encoded parity is `p`:
+
+```
+D6 = 3*A6 + W - 146
+   = 3*B4 + (73-2*W) - 6*p4 - 3*p5
+A8 = (4/3)*D6 - (4/3)*(W-146) - 15 - 2*p6 - p7
+4/3 modulo 2**32 = 0xAAAAAAAC
+```
+
+Thus odd record stride does not require division or another address vector.
+Every encoded node is prepared by emitted runtime instructions. Reuse the
+original transpose buffers; deep reads wait for their24 stores, while the
+first table waits only for its own8 stores. The last deep vload reads some
+unused input words, within allocated memory; only its first three fields
+are consumed. Header and the complete forest remain unchanged.
+
+The extra deep record removes one gather level. Disable the seven-group
+final-depth4 cache, trading56 additional final loads for91 fewer flow slots
+and its live coefficient storage. The compact path intentionally ignores
+the old `BLOCKED_FINAL_CACHE_CHUNKS` setting; the fallback retains it.
+
+Use the freed flow slots to select a COMPLETE address bias at depths4/6,
+then one MAC, instead of two arithmetic operations. The following child
+round already has its node, so its hash hides address latency. Selecting
+biases at8/9 instead gives951;4/8 gives950;6/8 gives949 with full policies
+and scratch-provenance checks. The parent-round placement is better even
+when another variant has slightly fewer aggregate operations.
+
+### Correctness finding: end-of-cycle write collisions during reuse
+
+Some combined probes failed seed123. A new logical-to-physical scratch
+provenance checker found two writes to scratch357 at cycle34: an old
+setup lifetime ended with a write as a new node lifetime began writing.
+The prior `last_use <= first_use` coloring rule allowed this collision.
+The simulator's engine/slot write order could then choose the wrong value.
+No failing combination's cycle count is accepted.
+
+The allocator now permits equality only when the old final access is
+read-only. It preserves safe start-cycle-read/end-cycle-write reuse and
+forbids write/write collisions. The same instruction graphs then pass the
+provenance and frozen checks. Boundary fixtures test both rules and an
+indivisible16-word allocation. This is an allocator fix, not a simulator
+change or relaxed dependence rule. The unchanged old path still gives954.
+
+### Accepted A/B and direct landing
+
+The first five rows use ordinary deep record reads (`--compact-deep-landing 0`).
+Parent-bias selection also omits its now-unused -2/-6 vector constants.
+
+| Layout / options | Cycles | Scratch | Loads | Compute equivalents | Flow |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Old accepted path | 954 | 1,477 | 1,829 | 6,910.75 | 891 |
+| Compact only | 956 | 1,440 | 1,648 | 6,929.625 | 832 |
+| Compact + parent bias selection | 948 | 1,432 | 1,648 | 6,865.625 | 896 |
+| Compact + lane tail only | 956 | 1,424 | 1,648 | 6,929.625 | 832 |
+| Compact + both | 944 | 1,408 | 1,648 | 6,865.625 | 896 |
+| Both + deep left-child landing | **941** | **1,480** | **1,648** | **6,833.625** | **896** |
+
+Before pruning the unused bias vectors, compact + both gives947 with
+6,867.625 equivalents and1,416 scratch. Pruning is a separate3-cycle gain
+on that graph. All original scheduler policies remain; no new policy
+parameters are needed for this iteration's accepted results.
+
+On the load-light graph, revisit the previously losing landing idea ONLY
+for the new deep records. Store `[left,parent,right]`, start successive
+eight-word loads at consecutive scratch words, and consume parent/right
+before the next overwrite. The eight left fields land directly in a
+contiguous vector, eliminating256 scalar copies (32 equivalents).
+Keep all15 actually touched words inside one16-word allocation span. The
+allocator must not color its two halves independently. Strict serial read
+dependencies remain; no same-cycle WAR scheduling is introduced.
+
+This now saves three cycles, unlike the old load-heavy graph. It costs72
+more scratch words versus944 because of interval length and contiguous
+allocation. The final margin is56 words, not128. This tradeoff is explicit.
+
+### Final accounting, acceptance and continuation
+
+Final slots: load1,648, VALU5,503, ALU10,645, flow896, store64. Compared with
+954: -181 loads, -96 VALU, +151 ALU, +5 flow, +16 stores and +3 scratch.
+Weighted work drops77.125 to6,833.625; optimistic combined compute floor
+is912. Necessary900 deficit:83.625 compute equivalents, zero load slots.
+Flow has just four aggregate spare slots;41 elapsed cycles remain.
+
+Body lookup count is512 record vloads +1,024 scalar gathers =1,536,
+first/last53/930 and drain10. Conditional lookup finish bound821; this is
+no longer the dominant aggregate bound. Offloaded265, fragmented189,
+maximum fragment span62; strict dependencies, exact emission and every
+scratch read's producer are checked. Workspace is240 encoded nodes and16
+zero padding words. Only final input values and the declared workspace
+are written.
+
+Official9/9, built-in3/3, 32 frozen seeds1000..1031, eight full-word fixtures,
+workspace, emission and provenance pass. Six extra shapes and three alternate
+direct-path depths each pass three seeds with unchanged cycles. Dedicated
+allocator boundary fixtures pass. No leaderboard query, submission, commit
+or push was performed in this iteration.
+
+Next cost shallow direct landing on THIS graph, including its final-parent
+offset and remaining scratch. Its approximate30-equivalent net ceiling
+would still leave about54 compute equivalents to remove for900, before
+readiness losses. Continue bounded state/body search; eight rejected SMT
+templates do not close that direction. Avoid spending nonexistent flow
+headroom or assuming more contiguous scratch is free.
+
+Reproduce (Z3 is needed only for the optional state-search command):
+
+```sh
+python3 experiments/iteration37_three_level.py --window 2 --banks 2 --full-policies
+python3 experiments/iteration37_state_search.py --seconds 12
+python3 experiments/iteration37_lane_tail.py --full-policies
+python3 experiments/iteration37_frontier_budget.py
+python3 experiments/iteration37_compact_deep.py --cache 0 --index-select 4 6 --lane-tail --full-policies --safe-reuse --dataflow --drop-unused-biases
+python3 experiments/iteration37_deep_landing.py --full-policies
+python3 tune_kernel.py --compact-deep-landing 0 --compact-lane-tail 0 1 --compact-parent-index-select 0 1 --seeds 123 456 789
+python3 tune_kernel.py --blocked-compact-deep 0 --seeds 123 456 789
+python3 tests/submission_tests.py
+python3 perf_takehome.py
+python3 verify_kernel.py --extra-shapes
+```

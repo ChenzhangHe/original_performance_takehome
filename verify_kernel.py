@@ -14,6 +14,7 @@ from analyze_kernel import AnalyzedKernel, analyze
 from problem import SLOT_LIMITS, VLEN
 from tune_kernel import check, Input, Machine, Tree, build_mem_image, reference_kernel2
 from frozen_problem import HASH_STAGES
+from experiments.dataflow_check import verify_dataflow
 
 
 def verify_emission(builder):
@@ -82,6 +83,34 @@ def verify_analysis(builder, report):
         assert any(op.get("is_setup", False) and op["round"] > 0 for op in builder.operations)
 
 
+def verify_allocator_boundaries():
+    """Exercise write/write rejection, legal read/write reuse and wide spans."""
+    def fixture(writer_at_end, span=1):
+        builder = kernel.KernelBuilder()
+        old = builder.alloc_scratch("old", 8)
+        source = builder.alloc_scratch("source")
+        virtual = 10000
+        first = ("valu", ("vbroadcast", old, source)) if writer_at_end else ("store", ("vstore", source, old))
+        second = ("valu", ("vbroadcast", virtual, source))
+        entries = [first, second]
+        if span == 2:
+            entries.append(("valu", ("vbroadcast", virtual+8, source)))
+        ops = [dict(engine=engine, slot=slot) for engine, slot in entries]
+        bundle = {}
+        for engine, slot in entries:
+            bundle.setdefault(engine, []).append(slot)
+        builder.instrs = [bundle]
+        builder.allocate_node_lifetimes(ops, [(virtual, 1, len(ops), -span if span > 1 else 1)], (old,))
+        return old, ops
+    old, writes = fixture(True)
+    assert writes[1]["slot"][1] != old, "Two writes cannot reuse a scratch word in one cycle"
+    old, reads = fixture(False)
+    assert reads[1]["slot"][1] == old, "Start-cycle read/end-cycle write reuse should remain available"
+    old, wide = fixture(True, 2)
+    assert wide[2]["slot"][1] == wide[1]["slot"][1]+8
+    assert not (set(range(old, old+8)) & set(range(wide[1]["slot"][1], wide[1]["slot"][1]+16)))
+
+
 def verify_extra_shapes():
     results = []
     for height, rounds, batch in ((3, 5, 32), (4, 7, 64), (6, 11, 128),
@@ -111,9 +140,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--extra-shapes", action="store_true")
     args = parser.parse_args()
+    verify_allocator_boundaries()
     builder = AnalyzedKernel()
     builder.build_kernel(10, 2047, 256, 16)
     verify_emission(builder)
+    verify_dataflow(builder)
     for seed in range(1000, 1032):
         check(builder, seed)
     patterns = (("zero", 0), ("ones", 0xFFFFFFFF),
@@ -132,7 +163,7 @@ def main():
     report.pop("rounds")
     if args.extra_shapes:
         report["extra_shape_checks"] = verify_extra_shapes()
-    print(json.dumps(dict(schedule_emission="pass", setup_accounting="pass", random_seeds=32,
+    print(json.dumps(dict(schedule_emission="pass", scratch_dataflow="pass", allocator_boundaries="pass", setup_accounting="pass", random_seeds=32,
                           full_word_fixtures=8, **report), indent=2))
 
 

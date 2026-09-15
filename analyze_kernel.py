@@ -13,6 +13,10 @@ class AnalyzedKernel(KernelBuilder):
         self.operations = ops
         super().schedule(ops)
 
+    def allocate_node_lifetimes(self, ops, uses, reusable=()):
+        self.logical_slots = [op["slot"] for op in ops]
+        super().allocate_node_lifetimes(ops, uses, reusable)
+
 
 def analyze(builder):
     operations = builder.operations
@@ -69,6 +73,10 @@ def analyze(builder):
         "blocked_early_tail_select": builder.blocked_early_tail_select,
         "blocked_unused_weight_pruned": builder.blocked_unused_weight_pruned,
         "blocked_encode_depth6": builder.blocked_encode_depth6,
+        "blocked_compact_deep": builder.blocked_compact_deep,
+        "compact_lane_tail": builder.compact_lane_tail,
+        "compact_parent_index_select": builder.compact_parent_index_select,
+        "compact_deep_landing": builder.compact_deep_landing,
         "blocked_reverse_input_chain_length": builder.blocked_reverse_input_chain_length,
         "direct_gather_addresses": builder.direct_gather_addresses,
         "engines": engines,

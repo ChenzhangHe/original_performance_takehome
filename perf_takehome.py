@@ -69,6 +69,10 @@ BLOCKED_DROP_UNUSED_WEIGHT = True
 BLOCKED_ENCODE_DEPTH6 = True
 BLOCKED_REVERSE_INPUT_CHAIN_LENGTH = 4  # Zero retains the original forward chains.
 BLOCKED_TAIL_START = 920
+BLOCKED_COMPACT_DEEP = True
+COMPACT_LANE_TAIL = True
+COMPACT_PARENT_INDEX_SELECT = True
+COMPACT_DEEP_LANDING = True
 
 
 class KernelBuilder:
@@ -533,6 +537,10 @@ class KernelBuilder:
         self.blocked_early_tail_select = blocked_lookup and BLOCKED_EARLY_TAIL_SELECT
         self.blocked_unused_weight_pruned = blocked_lookup and BLOCKED_DROP_UNUSED_WEIGHT
         self.blocked_encode_depth6 = blocked_lookup and BLOCKED_ENCODE_DEPTH6
+        compact_deep = self.blocked_compact_deep = self.blocked_encode_depth6 and BLOCKED_COMPACT_DEEP
+        self.compact_lane_tail = compact_deep and COMPACT_LANE_TAIL
+        self.compact_parent_index_select = compact_deep and COMPACT_PARENT_INDEX_SELECT
+        self.compact_deep_landing = compact_deep and COMPACT_DEEP_LANDING and BLOCKED_FUSE_PARENT_XOR
         assert BLOCKED_REVERSE_INPUT_CHAIN_LENGTH >= 0
         self.blocked_reverse_input_chain_length = BLOCKED_REVERSE_INPUT_CHAIN_LENGTH if blocked_lookup else 0
         assert BLOCKED_READ_BANKS in (1, 2, 4, 8)
@@ -544,12 +552,14 @@ class KernelBuilder:
             r < rounds and r % (forest_height + 1) == 4 for r in DEPTH4_CACHE_ROUNDS
         )
         if blocked_lookup:
-            cache_depth4 = BLOCKED_FINAL_CACHE_CHUNKS > 0
+            # Stride-3 records remove a full gather level. Spend that load
+            # headroom on the final lookup, releasing flow and cache scratch.
+            cache_depth4 = BLOCKED_FINAL_CACHE_CHUNKS > 0 and not compact_deep
         def depth4_cached(round_no, chunk_no):
             if blocked_lookup:
                 # These groups advance first in the cohort scheduler. Their
                 # final coefficient trees overlap the remaining deep gathers.
-                return (round_no == rounds - 1
+                return (not compact_deep and round_no == rounds - 1
                         and chunk_no >= chunk_count - BLOCKED_FINAL_CACHE_CHUNKS)
             if not cache_depth4 or round_no not in DEPTH4_CACHE_ROUNDS:
                 return False
@@ -739,11 +749,12 @@ class KernelBuilder:
 
         if blocked_lookup:
             readonly_zero = self.alloc_scratch("positive_zero")
-            neg2 = vector_const(0xFFFFFFFE, "path_neg2")
+            neg2 = (None if self.compact_parent_index_select
+                    else vector_const(0xFFFFFFFE, "path_neg2"))
             negative_weights = {2: vector_const(0xFFFFFFFC, "block_neg4")}
             address_bias = vector_const(0xFFFFFFFB, "address_bias")
             address_bases = {}
-            direct_vectors = [neg2, address_bias, negative_weights[2]]
+            direct_vectors = ([neg2] if neg2 is not None else []) + [address_bias, negative_weights[2]]
         elif positive_addresses:
             # Keep A itself once gathers begin. Before then, accumulate path
             # bits directly into the first gather address. Derive constants
@@ -826,8 +837,9 @@ class KernelBuilder:
             # A6=B+(73-block_base)-2*p4-p5, where encoded parity is inverted.
             # An optional contiguous depth-6 copy follows the 64 record words.
             # Its address offset is n_nodes+1; fold entry into this existing bias.
-            extra_delta = n_nodes + 1 if self.blocked_encode_depth6 else 0
-            block_exit_bias = vector_const((73-block_base+extra_delta) & 0xFFFFFFFF, "block_exit_bias")
+            extra_delta = n_nodes + 1 if self.blocked_encode_depth6 and not compact_deep else 0
+            block_exit_bias = vector_const((73-2*block_base if compact_deep else 73-block_base+extra_delta) & 0xFFFFFFFF,
+                                          "block_exit_bias")
             block_neg4 = negative_weights[2]
             # Every blocked group first gathers at depth 4 (or has no final
             # gather). Only depth-1/2 accumulation needs weights -16/-8;
@@ -842,7 +854,57 @@ class KernelBuilder:
             self.workspace_node_indices = [index for parent in range(15, 31)
                                            for index in (parent, 2*parent+1, 2*parent+2, None)]
             self.workspace_layout = "parent_children_stride4"
-            if self.blocked_encode_depth6:
+            if compact_deep:
+                self.preencoded_node_count += 192
+                self.workspace_node_indices.extend(index for parent in range(63, 127)
+                                                   for index in ((2*parent+1, parent, 2*parent+2) if self.compact_deep_landing
+                                                                 else (parent, 2*parent+1, 2*parent+2)))
+                self.workspace_layout = "stride4_depth45_stride3_depth67" + ("_left_first" if self.compact_deep_landing else "")
+                # D6=3*A6+W-146; after depth4, D6=3*B4+73-2*W-6*p4-3*p5.
+                # Since 3 is odd, 4/3 modulo 2**32 is 0xaaaaaaac. Thus
+                # A8=(4/3)*D6-(4/3)*(W-146)-15-2*p6-p7, with no division.
+                if self.compact_parent_index_select:
+                    deep_entry_even = vector_const((73-2*block_base-6)&0xffffffff, "deep_entry_even")
+                    direct_vectors.append(deep_entry_even)
+                deep_three = vector_const(3, "deep_three")
+                deep_neg6 = (None if self.compact_parent_index_select
+                             else vector_const(0xfffffffa, "deep_neg6"))
+                deep_neg3 = vector_const(0xfffffffd, "deep_neg3")
+                deep_scale = vector_const(0xaaaaaaac, "deep_four_over_three")
+                extra_exit_bias = vector_const((-0xaaaaaaac*(block_base-146)-15)&0xffffffff, "deep_exit_bias")
+                if self.compact_parent_index_select:
+                    deep_exit_even = vector_const((-0xaaaaaaac*(block_base-146)-17)&0xffffffff, "deep_exit_even")
+                direct_vectors.extend([deep_three] + ([deep_neg6] if deep_neg6 is not None else []) +
+                                      [deep_neg3, deep_scale, extra_exit_bias] +
+                                      ([deep_exit_even] if self.compact_parent_index_select else []))
+                # Reuse the original record transpose buffers after their last
+                # reads. Eight parents and sixteen children make three vstores.
+                deep_src = [self.alloc_scratch(f"deep_src_{i}") for i in range(3)]
+                for pointer, address in zip(deep_src, (70, 134, 142)):
+                    self.add("load", ("const", pointer, address))
+                double_step = self.scratch_const(16)
+                self.add("alu", ("+", block_store_addr, block_store_addr, address_step))
+                for parent_start in range(0, 64, 8):
+                    for buffer, pointer in zip(block_input, deep_src):
+                        self.add("load", ("vload", buffer, pointer))
+                    for vector_no in range(3):
+                        for lane in range(VLEN):
+                            parent, field = divmod(vector_no*VLEN+lane, 3)
+                            if self.compact_deep_landing and field < 2:
+                                field ^= 1
+                            if field == 0:
+                                scalar = block_input[0]+parent
+                            else:
+                                child = 2*parent+field-1
+                                scalar = block_input[1+child//VLEN]+child%VLEN
+                            self.add("alu", ("^", block_output+lane, scalar, final_xor_const))
+                        self.add("store", ("vstore", block_store_addr, block_output))
+                        if parent_start != 56 or vector_no != 2:
+                            self.add("alu", ("+", block_store_addr, block_store_addr, address_step))
+                    if parent_start != 56:
+                        for i, pointer in enumerate(deep_src):
+                            self.add("alu", ("+", pointer, pointer, address_step if i == 0 else double_step))
+            elif self.blocked_encode_depth6:
                 self.preencoded_node_count += 64
                 self.workspace_node_indices.extend(range(63, 127))
                 self.workspace_layout = "parent_children_stride4_plus_depth6"
@@ -889,7 +951,7 @@ class KernelBuilder:
             # Dynamic gathers require every store for THEIR level, not all
             # preprocessing. Depth-4 records must not wait for depth-6 copying.
             extra_level_stores, block_stores = block_stores[8:], block_stores[:8]
-            assert len(extra_level_stores) == 8
+            assert len(extra_level_stores) == (24 if compact_deep else 8)
         block_children_base = path_bits_base + rounds * batch_size
         ops = setup_ops
         setup_count = len(setup_ops)
@@ -1371,18 +1433,49 @@ class KernelBuilder:
                     val_ready = emit(
                         "valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected
                     )
-                elif blocked_lookup and depth == 4 and round_no != rounds - 1:
+                elif self.compact_deep_landing and depth == 6:
+                    # Overlapping reads preserve earlier left-child lanes.
+                    # Only the parent/right fields are consumed before the
+                    # next load overwrites them. Keep strict WAR dependencies.
                     block_use_start = len(ops)
+                    record_base = block_children_base + 2*batch_size + chunk_count*BLOCKED_READ_BANKS*VLEN
+                    block_left = record_base + 3*offset
+                    block_right = block_left + 2*VLEN
+                    pending = None
+                    node_loads = []
+                    block_children_ready = []
+                    node_address_reads = []
+                    for lane in range(VLEN):
+                        read_buffer = block_left+lane
+                        loaded = emit("load", ("vload", read_buffer, chunk_idx+lane),
+                                      idx_ready[lane] if isinstance(idx_ready, list) else idx_ready,
+                                      extra_level_stores, pending)
+                        node_address_reads.append(loaded)
+                        parent = emit("alu", ("^", chunk_val+lane, chunk_val+lane, read_buffer+1), loaded, val_ready)
+                        child = emit("alu", ("+", block_right+lane, read_buffer+2, readonly_zero), loaded)
+                        pending = [parent, child]
+                        node_loads.append(parent)
+                        block_children_ready.extend((loaded, child))
+                    val_ready = [*node_loads, *pending]
+                elif blocked_lookup and (depth == 4 or (compact_deep and depth == 6)) and round_no != rounds - 1:
+                    block_use_start = len(ops)
+                    record_base = block_children_base
+                    record_stores = block_stores
+                    if depth == 6:
+                        record_base += 2*batch_size + chunk_count*BLOCKED_READ_BANKS*VLEN
+                        record_stores = extra_level_stores
+                    block_left = record_base + 2*offset
+                    block_right = block_left + VLEN
                     pending = [None] * BLOCKED_READ_BANKS
                     node_loads = []
                     block_children_ready = []
                     node_address_reads = []
                     for lane in range(VLEN):
                         bank = lane % BLOCKED_READ_BANKS
-                        read_buffer = block_children_base + 2*batch_size + (chunk_no*BLOCKED_READ_BANKS+bank)*VLEN
+                        read_buffer = record_base + 2*batch_size + (chunk_no*BLOCKED_READ_BANKS+bank)*VLEN
                         loaded = emit("load", ("vload", read_buffer, chunk_idx+lane),
                                       idx_ready[lane] if isinstance(idx_ready, list) else idx_ready,
-                                      block_stores, pending[bank])
+                                      record_stores, pending[bank])
                         node_address_reads.append(loaded)
                         if BLOCKED_FUSE_PARENT_XOR:
                             # Consume the parent directly from the read buffer.
@@ -1402,13 +1495,19 @@ class KernelBuilder:
                     all_copies = [dep for group in pending if group for dep in group]
                     val_ready = ([*node_loads, *all_copies] if BLOCKED_FUSE_PARENT_XOR else
                                  emit("valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, node_loads, all_copies))
-                    node_pool_uses.extend((block_children_base+2*batch_size+(chunk_no*BLOCKED_READ_BANKS+bank)*VLEN,
+                    node_pool_uses.extend((record_base+2*batch_size+(chunk_no*BLOCKED_READ_BANKS+bank)*VLEN,
                                            block_use_start, len(ops), 1) for bank in range(BLOCKED_READ_BANKS))
-                elif blocked_lookup and depth == 5:
+                elif blocked_lookup and (depth == 5 or (compact_deep and depth == 7)):
                     selected = select(chunk_node, block_parity, block_left, block_right,
                                       block_parity_ready, block_children_ready)
                     val_ready = emit("valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected)
-                    node_pool_uses.extend((dest, block_use_start, len(ops), 1) for dest in (block_left, block_right))
+                    if self.compact_deep_landing and depth == 7:
+                        # Negative width denotes one indivisible contiguous
+                        # span, not two independently colored vectors.
+                        node_pool_uses.append((block_left, block_use_start, len(ops), -2))
+                        node_pool_uses.append((block_right, block_use_start, len(ops), 1))
+                    else:
+                        node_pool_uses.extend((dest, block_use_start, len(ops), 1) for dest in (block_left, block_right))
                 else:
                     encoded_node = ((blocked_lookup and (depth == 4 or (self.blocked_encode_depth6 and depth == 6)))
                                     or (preencode and encode_first <= depth <= encode_last))
@@ -1455,9 +1554,13 @@ class KernelBuilder:
                 if cached_lookup:
                     node_pool_uses.append((chunk_node, lookup_start, len(ops), NODE_VIRTUAL_VECTORS))
                 if blocked_lookup and depth == 4 and round_no != rounds - 1:
-                    index_base_ready = emit("valu", ("+", chunk_idx, chunk_idx, block_exit_bias), node_address_reads)
+                    if not self.compact_parent_index_select:
+                        slot = (("multiply_add", chunk_idx, chunk_idx, deep_three, block_exit_bias) if compact_deep
+                                else ("+", chunk_idx, chunk_idx, block_exit_bias))
+                        index_base_ready = emit("valu", slot, node_address_reads)
                 elif (positive_addresses and first_gather_depth is not None
-                        and not (blocked_lookup and depth == 5)
+                        and not (blocked_lookup and (depth == 5 or (compact_deep and depth == 7)
+                                                      or (self.compact_parent_index_select and depth == 6)))
                         and depth >= first_gather_depth and round_no < rounds - 1
                         and depth < forest_height):
                     # A' = 2*A - 5 - p. Prepare the affine base while hashing,
@@ -1469,7 +1572,7 @@ class KernelBuilder:
                     if self.blocked_encode_depth6 and depth == 6:
                         bias = extra_exit_bias
                     index_base_ready = emit(
-                        "valu", ("multiply_add", chunk_idx, chunk_idx, two, bias), node_address_reads
+                        "valu", ("multiply_add", chunk_idx, chunk_idx, deep_scale if compact_deep and depth == 6 else two, bias), node_address_reads
                     )
                 for stage, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     if stage == 3:
@@ -1512,12 +1615,18 @@ class KernelBuilder:
                                 shifted,
                             )
                         else:
-                            val_ready = emit(
-                                "valu",
-                                ("^", chunk_val, chunk_val, chunk_tmp2),
-                                val_ready,
-                                shifted,
-                            )
+                            if self.compact_lane_tail and depth in (5, 6, 7, 8, 9):
+                                # A finished lane can expose its path bit and
+                                # next gather without waiting for the other 7.
+                                val_ready = [emit("alu", ("^", chunk_val+lane, chunk_val+lane, chunk_tmp2+lane),
+                                                  val_ready, shifted) for lane in range(VLEN)]
+                            else:
+                                val_ready = emit(
+                                    "valu",
+                                    ("^", chunk_val, chunk_val, chunk_tmp2),
+                                    val_ready,
+                                    shifted,
+                                )
                     elif (op1, op2, op3) == ("+", "+", "<<"):
                         multiplier = 1 + (1 << val3)
                         val_ready = emit(
@@ -1571,15 +1680,17 @@ class KernelBuilder:
                 # Keep p at the root; later use S'=2*S+p on the fallback or
                 # subtract p from the direct path's precomputed address base.
                 parity_dest = chunk_idx if depth == 0 else chunk_tmp1
-                if depth < retained_depth or (blocked_lookup and depth == 4):
+                if depth < retained_depth or (blocked_lookup and (depth == 4 or (compact_deep and depth == 6))):
                     # Unique logical producer per group/round; its storage is
                     # colored over all consumers without inserting copies.
                     parity_dest = path_bits_base + (round_no * chunk_count + chunk_no) * VLEN
                     path_bit_uses.append((parity_dest, len(ops)))
-                parity = emit_scalar_rhs(
-                    "&", parity_dest, chunk_val, one, val_ready
-                )
-                if depth < retained_depth or (blocked_lookup and depth == 4):
+                if self.compact_lane_tail and depth in (5, 6, 7, 8, 9):
+                    parity = [emit("alu", ("&", parity_dest+lane, chunk_val+lane, one),
+                                   val_ready[lane]) for lane in range(VLEN)]
+                else:
+                    parity = emit_scalar_rhs("&", parity_dest, chunk_val, one, val_ready)
+                if depth < retained_depth or (blocked_lookup and (depth == 4 or (compact_deep and depth == 6))):
                     path_bits[depth] = (parity_dest, parity)
                 if depth == 0:
                     idx_ready = parity
@@ -1588,14 +1699,33 @@ class KernelBuilder:
                     idx_ready = None
                     continue
                 if positive_addresses:
+                    if self.compact_parent_index_select and depth in (4, 6):
+                        # The next round already has its child value. Spend a
+                        # flow select here, hiding address work behind that hash
+                        # instead of adding it immediately before a deep gather.
+                        block_parity, block_parity_ready = parity_dest, parity
+                        even_bias, odd_bias, scale = ((deep_entry_even, block_exit_bias, deep_three) if depth == 4
+                                                     else (deep_exit_even, extra_exit_bias, deep_scale))
+                        chosen_bias = select(chunk_tmp1, parity_dest, even_bias, odd_bias, parity)
+                        idx_ready = emit("valu", ("multiply_add", chunk_idx, chunk_idx, scale, chunk_tmp1), idx_ready, chosen_bias)
+                        continue
                     if blocked_lookup and depth == 3:
                         idx_ready = emit("valu", ("multiply_add", chunk_idx, parity_dest, block_neg4, chunk_idx), parity, idx_ready)
                         continue
                     if blocked_lookup and depth == 4:
                         block_parity, block_parity_ready = parity_dest, parity
-                        idx_ready = emit("valu", ("multiply_add", chunk_idx, parity_dest, neg2, chunk_idx), parity, index_base_ready)
+                        idx_ready = emit("valu", ("multiply_add", chunk_idx, parity_dest, deep_neg6 if compact_deep else neg2, chunk_idx), parity, index_base_ready)
                         continue
                     if blocked_lookup and depth == 5:
+                        if compact_deep:
+                            idx_ready = emit("valu", ("multiply_add", chunk_idx, parity_dest, deep_neg3, chunk_idx), parity, idx_ready)
+                            continue
+                        index_base_ready = idx_ready
+                    if compact_deep and depth == 6:
+                        block_parity, block_parity_ready = parity_dest, parity
+                        idx_ready = emit("valu", ("multiply_add", chunk_idx, parity_dest, neg2, chunk_idx), parity, index_base_ready)
+                        continue
+                    if compact_deep and depth == 7:
                         index_base_ready = idx_ready
                     if first_gather_depth is None:
                         idx_ready = None
@@ -1732,8 +1862,9 @@ class KernelBuilder:
                     first_times.setdefault(id(slot), cycle)
         intervals = []
         for base, start, end, width in uses:
-            for address in (base + n * VLEN for n in range(width)):
-                addresses = set(range(address, address + VLEN))
+            spans = [(base, -width)] if width < 0 else [(base+n*VLEN, 1) for n in range(width)]
+            for address, span in spans:
+                addresses = set(range(address, address + span*VLEN))
                 touched = []
                 for op in ops[start:end]:
                     reads, writes = self.instruction_accesses(op["engine"], op["slot"])
@@ -1742,30 +1873,51 @@ class KernelBuilder:
                 if touched:
                     # A fragmented vector may first touch its registers well
                     # before its final lane completes. Protect that full span.
+                    last = max(times[id(o["slot"])] for o in touched)
+                    ends_with_write = any(times[id(o["slot"])] == last
+                                          and addresses & self.instruction_accesses(o["engine"], o["slot"])[1]
+                                          for o in touched)
                     intervals.append((min(first_times[id(o["slot"])] for o in touched),
-                                      max(times[id(o["slot"])] for o in touched),
-                                      address, start, end))
+                                      last, address, start, end, ends_with_write, span))
         # A cache coefficient's physical vector can host nodes after its last
         # scheduled use. All original reads finish before any reused write.
         last_use = {address: -1 for address in reusable}
+        last_write = {address: -1 for address in reusable}
         for op in ops:
             reads, writes = self.instruction_accesses(op["engine"], op["slot"])
             for address in reusable:
                 if any(address <= a < address + VLEN for a in reads | writes):
                     last_use[address] = max(last_use[address], times[id(op["slot"])])
+                if any(address <= a < address + VLEN for a in writes):
+                    last_write[address] = max(last_write[address], times[id(op["slot"])])
         physical_slots = list(reusable)
         slots_end = [last_use[address] for address in reusable]
+        read_only_end = [last_write[address] < last_use[address] for address in reusable]
         replacements = {}
-        for first, last, address, start, end in sorted(intervals):
-            # Reads observe start-of-cycle state, writes commit at cycle end.
-            color = next((i for i, stop in enumerate(slots_end) if stop <= first),
-                         len(slots_end))
-            if color == len(slots_end):
-                slots_end.append(last)
-                physical_slots.append(self.scratch_ptr + (color - len(reusable)) * VLEN)
-            else:
+        for first, last, address, start, end, ends_with_write, span in sorted(intervals):
+            # An old READ may share a cycle with the next value's first WRITE.
+            # Two end-of-cycle writes must never share physical scratch, even
+            # if the earlier value is dead: the simulator would resolve their
+            # collision by engine/slot order, not by these logical lifetimes.
+            physical_index = {base: i for i, base in enumerate(physical_slots)}
+            colors = None
+            for base in physical_slots:
+                indices = [physical_index.get(base+n*VLEN) for n in range(span)]
+                if all(i is not None and (slots_end[i] < first or (slots_end[i] == first and read_only_end[i]))
+                       for i in indices):
+                    colors = indices
+                    break
+            if colors is None:
+                colors = []
+                for _ in range(span):
+                    colors.append(len(slots_end))
+                    physical_slots.append(self.scratch_ptr+(len(slots_end)-len(reusable))*VLEN)
+                    slots_end.append(last)
+                    read_only_end.append(not ends_with_write)
+            for color in colors:
                 slots_end[color] = last
-            physical = physical_slots[color]
+                read_only_end[color] = not ends_with_write
+            physical = physical_slots[colors[0]]
             for op in ops[start:end]:
                 original = op["slot"]
                 slot = list(replacements.get(id(original), original))
@@ -1776,7 +1928,7 @@ class KernelBuilder:
                              and slot[0] != "const" else (1,))
                 for pos in positions:
                     # Compare original addresses, never already-renamed ones.
-                    if address <= original[pos] < address + VLEN:
+                    if address <= original[pos] < address + span*VLEN:
                         slot[pos] = physical + original[pos] - address
                 replacements[id(original)] = tuple(slot)
         self.alloc_scratch("node_pool", (len(slots_end) - len(reusable)) * VLEN)

@@ -2,7 +2,8 @@
 
 Iteration34 scripts default to **1d27efc** (970 cycles); the iteration35
 deadline script pins **468f713** (969 cycles); iteration36 scripts pin
-**3d24666** (955 cycles). They read `perf_takehome.py`
+**3d24666** (955 cycles). Iteration37 kernel probes pin **2d5bc94** (954).
+They read `perf_takehome.py`
 from those commits, transform that source **in memory**, and run the frozen simulator.
 They do not edit the kernel, tests, simulator, inputs, or git history. Run
 them from a checkout containing those commits. Their default results are
@@ -89,3 +90,50 @@ The new default is954, one cycle faster than955, with20.25 fewer compute
 equivalents but three more loads. See iteration36 in the log for its complete
 accounting and rejected variants. The experiments' tail-start option REPLACES
 one candidate; production ADDS the920 candidate and retains the old900 one.
+
+## Iteration37: compact records, stronger validation, 941 cycles
+
+The iteration37 kernel probes transform the fixed954 source in memory.
+Without `--full-policies`, they normally screen just the old900/920 fragment
+policies; those timings must not be confused with a full scheduler search.
+Do not apply older `--source-ref working-tree` textual transforms blindly
+to the new compact reader: use the explicit historical commit instead.
+
+```sh
+# Eight-word three-level record: valid, but slow (1031 cycles).
+python3 experiments/iteration37_three_level.py --window 2 --banks 2 --full-policies
+
+# Optional research dependency ONLY: z3-solver==4.15.4.0 in an isolated env.
+# Eight precise templates are UNSAT; this is not a hash-optimality proof.
+python3 experiments/iteration37_state_search.py --seconds 12
+
+# Lane-level terminal XOR/parity consumers: ties954 on the old graph.
+python3 experiments/iteration37_lane_tail.py --full-policies
+# Analytical routing cost screen, not a kernel timing.
+python3 experiments/iteration37_frontier_budget.py
+
+# Compact stride-3 records + early parent bias selection + lane tails: 944.
+python3 experiments/iteration37_compact_deep.py --cache 0 --index-select 4 6 --lane-tail --full-policies --safe-reuse --dataflow --drop-unused-biases
+# Direct left-child landing on the NEW load-light graph: 941.
+python3 experiments/iteration37_deep_landing.py --full-policies
+
+# Full current-kernel A/B and acceptance, no Z3 dependency.
+python3 tune_kernel.py --compact-deep-landing 0 --compact-lane-tail 0 1 --compact-parent-index-select 0 1 --seeds 123 456 789
+python3 tune_kernel.py --blocked-compact-deep 0 --seeds 123 456 789
+python3 verify_kernel.py --extra-shapes
+```
+
+`dataflow_check.py` checks physical scratch provenance against original
+logical producers and rejects same-cycle write/write collisions. Production
+now fixes the allocator boundary, and its local verifier uses this checker.
+The compact probe retains the old allocator by default for reproducing the
+failure: always use `--safe-reuse --dataflow` for accepted comparisons. For
+example the lane-tail + parent-select combination without safe reuse fails
+seed123; no timing from that failed run is reported as valid. Scratch
+overflows likewise remain rejections, not hypothetical scores.
+
+The deep-landing probe verifies its full contiguous16-word span, three frozen
+seeds and full-word workspace. Production additionally passes the complete
+32-seed/eight-fixture suite, official tests, extra shapes and allocator
+boundary regressions. See iteration37 of the log for budgets and every
+important negative result. Kernel code does not import experiment modules.

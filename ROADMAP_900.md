@@ -1,5 +1,68 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration 37, **941 cycles**, scratch
+**1,480 / 1,536**, parent `2d5bc94` (954). The 13-cycle improvement removes
+real lookup/copy work; the ten-operation hash is unchanged.
+
+Keep the 64-word depth4/5 table, replace the linear depth6 copy with 192
+words of stride-3 depth6/7 records, and stop caching the final depth4 round.
+The complete 256-word index workspace holds 240 encoded nodes and 16 zero
+padding words. Odd-stride address conversion is one modular multiply-add,
+not division. Select complete address biases at the PREFETCHED parent
+rounds4/6, where the following child hash hides the dependency; this is
+better than putting the same selects immediately before gathers8/9.
+
+Release terminal hash/parity consumers lane by lane. Then reorder only the
+deep records to `[left,parent,right]`: overlapping loads land the left
+children directly, deleting another 32 compute equivalents. This old idea
+now wins on a graph with load headroom. Protect its entire 16-word landing
+span as one allocation and retain strict load/reader dependencies.
+
+Slots: load **1,648**, VALU **5,503**, ALU **10,645**, flow **896**, store
+**64**. Weighted compute **6,833.625**, optimistic combined compute floor
+**912**. Versus954: **-77.125 compute equivalents, -181 loads, +5 flow,
++16 stores, +3 scratch**. Necessary900 deficits are now **83.625 compute
+equivalents and zero loads**; flow has just four aggregate spare slots.
+There are still 41 elapsed cycles to900. No complete route is demonstrated.
+
+Combined body lookup traffic is512 record vloads +1,024 scalar gathers
+=1,536, first/last **53/930**, drain10. The conditional lookup finish bound
+is821: load throughput is no longer the aggregate obstacle. Compute and
+flow readiness dominate. Do not mistake smaller lookup traffic for a
+guaranteed900 schedule.
+
+This iteration also fixed scratch reuse when an OLD lifetime ends with a
+write: it cannot share a cycle with the NEW lifetime's first write. Legal
+same-cycle old-read/new-write reuse remains. A new provenance checker
+verifies every physical scratch read and rejects write collisions; dedicated
+boundary fixtures cover both rules and contiguous spans. This exposed
+invalid prototype combinations that are not counted as valid timings.
+
+Next, in order:
+
+1. Cost shallow-record direct landing on THIS load-light graph. Its ceiling
+   is approximately another30 net equivalents, not enough alone for900;
+   include final-round parent offset, buffer serialization and the56-word
+   scratch margin. Keep the accepted deep landing as the control.
+2. Find at least another84 net compute equivalents without consuming more
+   than four net flow slots. The earlier SMT search excluded eight precise
+   encoding/fusion templates, not all shorter hashes. Broaden the expression
+   family only with an explicit ISA/endpoint/path-bit budget.
+3. Reduce compute/flow waiting on the cheaper graph. Full sorting is not a
+   free locality optimization: the scalar-scatter four-pass radix model
+   alone requires1,152 store cycles including restoration. Other routing
+   algorithms remain open, but need a concrete storage and movement plan.
+
+Official9/9, built-in3/3, 32 frozen seeds, eight full-word fixtures, exact
+emission/provenance/workspace checks, six extra shapes and three alternate
+path depths pass. Reproduce954 with `--blocked-compact-deep 0`; disabling
+only `--compact-deep-landing 0` gives944. `BLOCKED_FINAL_CACHE_CHUNKS`
+continues to control the OLD path; compact records deliberately disable
+that cache. No tests/simulator changes, leaderboard query or submission.
+See iteration37 of the log and pinned scripts for accepted and rejected work.
+
+The implementation status below is historical.
+
 Latest accepted implementation: iteration 36, **954 cycles**, scratch
 **1,477**, parent `3d24666`. This is only **one cycle** faster than955.
 Runtime-encode the64 depth-6 nodes after the existing64-word record table;
