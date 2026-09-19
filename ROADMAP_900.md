@@ -1,6 +1,59 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
-Latest accepted implementation, iteration39 (2026-09-18): **927 cycles**, scratch
+Latest accepted implementation, iteration40 (2026-09-19): **924 cycles**, scratch
+**1,424/1,536**, unchanged work6745.625. This checkpoint bundles the verified
+three-cycle improvement and research records over the pushed927 parent
+`ee87c658e6247232801432d7ab5a548d324c096d` on `optimize/kernel-v2` in the user's
+fork. Official9/9, built-in3/3,32 frozen seeds,eight full-word fixtures,
+emission/provenance, allocator/workspace checks, six extra shapes and three
+alternate path depths pass. No official tests or simulator were modified.
+
+The accepted change is an eligibility-aware stable sort: ready fused
+`multiply_add` operations receive VALU capacity before ordinary vectors in
+fragmented policies. Scalar ALUs cannot issue FMA, but can perform the binary
+operations. Thirteen additional vector operations move to scalar issue,
+without removing work or changing the dependency graph. Physical counts:
+load1783, VALU5417, ALU10629, flow864, store64. `--compact-fma-priority 0`
+exactly restores927;1 gives924. The rule is gated by compact flow exchange,
+so generic and exchange-disabled paths retain their previous behavior.
+
+First/last flow14/898 has21 holes, versus24 on927. The last gather advances
+916→913; the final store is at zero-based cycle923, for924 elapsed cycles.
+The ten-cycle drain is unchanged. Combined lookup traffic remains1664,
+first/last54/913, conditional finish bound886. The physical VALU count alone
+has floor903; combined compute has an optimistic900 floor and a903 bound
+conditioned on the measured startup. Neither is an achieved900 schedule.
+
+Bounded alternatives did not add to the winner. Critical-chain feedback
+gets926 by itself but stays924 with FMA priority. Narrowing shallow lookup
+readiness to its four relevant stores gets926 alone, but925 with FMA priority.
+Completing fragmented vectors within one cycle ties924 and adds scheduling
+complexity. Speculatively fetching both possible depth3 children takes935
+and increases work. Do not combine independent local gains arithmetically.
+
+Next, in order:
+
+1. Treat the entire consumer frontier as the scheduling unit when examining
+   the tail. Its current longest wait names one lane of an eight-load gather;
+   promoting that lane merely changes which lane finishes last. Measure
+   advancement of all required producers and the end-to-end store.
+2. Create real arithmetic margin by changing hash expression topology or
+   finding costed cross-item reuse. Pre-encoding all depth8 nodes adds32 setup
+   XORs to remove32 body XORs, plus64 memory slots, and displaces useful
+   records. It has zero net arithmetic saving before those extra costs.
+3. Do not keep tuning constants in the existing final three-MAC/XOR topology.
+   A low16-bit UNSAT necessary condition excludes raw-output absorption in
+   that template even with arbitrary multipliers, biases and stage1 XOR
+   encoding. This is not a proof that the complete hash is globally optimal.
+
+There are still24 elapsed cycles to900. The new flag and pinned experiments
+make the924 result reproducible; no leaderboard query, external submission
+or global-record claim was made. See iteration40 in the log and
+`experiments/README.md` for results, exact controls and proof boundaries.
+
+The following iteration39 status and its budget are historical.
+
+Accepted implementation, iteration39 (2026-09-18): **927 cycles**, scratch
 **1,432/1,536**, unchanged work6745.625. The928 baseline was committed and
 pushed as `161c60200be0aa071532f6784817a5b562e9c2c8` to the user's fork on
 `optimize/kernel-v2`. This checkpoint bundles the927 implementation and
@@ -16,8 +69,9 @@ last gather916 rather than917, and completion926 rather than927. There are
 24 flow holes instead of20: most of the earlier start is absorbed by later
 waiting, so the elapsed win is one cycle, not five. Starting one group can
 move first flow to13 but still takes930. Thus19 was never a hardware minimum.
-`--compact-startup-groups 0` restores928;2 enables927. Generic paths and
-the exchange-disabled control retain their prior scheduling behavior.
+With FMA priority disabled, `--compact-startup-groups 0` restores928;2
+enables927. Generic paths and the exchange-disabled control retain their
+prior scheduling behavior.
 Physical slots are load1783, VALU5430, ALU10525, flow864, store64. The ideal
 aggregate compute floor remains900, but the startup-conditioned bound for
 this schedule is903. No900-cycle execution or global-best score is claimed.

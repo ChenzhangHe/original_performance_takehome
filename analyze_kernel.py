@@ -90,6 +90,7 @@ def analyze(builder):
         "compact_setup_deadline_cap": getattr(builder, "compact_setup_deadline_cap", 4),
         "compact_deep_select_delay": getattr(builder, "compact_deep_select_delay", 0),
         "compact_startup_groups": getattr(builder, "compact_startup_groups", 0),
+        "compact_fma_priority": getattr(builder, "compact_fma_priority", False),
         "blocked_reverse_input_chain_length": builder.blocked_reverse_input_chain_length,
         "direct_gather_addresses": builder.direct_gather_addresses,
         "engines": engines,

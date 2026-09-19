@@ -79,6 +79,7 @@ COMPACT_FLOW_EXCHANGE = True
 COMPACT_DEPTH3_GATHER_CHUNKS = 16
 COMPACT_DEEP_SELECT_DELAY = 1
 COMPACT_STARTUP_GROUPS = 2  # Zero restores the pre-bootstrap schedule.
+COMPACT_FMA_PRIORITY = True
 
 
 class KernelBuilder:
@@ -372,6 +373,11 @@ class KernelBuilder:
                         # Stable sorting preserves every existing policy's
                         # ordering among operations outside the startup DAG.
                         candidates.sort(key=lambda i: (i in startup_dag, startup_distance[i]), reverse=True)
+                    if (getattr(self, "compact_fma_priority", False)
+                            and fragmented and engine == "valu"):
+                        # Scalar ALUs cannot issue multiply_add. Give these
+                        # operations VALU slots before offloadable binaries.
+                        candidates.sort(key=lambda i: ops[i]["slot"][0] == "multiply_add", reverse=True)
                     capacity = SLOT_LIMITS[engine]
                     # Reserve a whole eight-lane group before scalar issue
                     # when its ready queue is short. This avoids fragmenting
@@ -580,6 +586,7 @@ class KernelBuilder:
         self.compact_deep_landing = compact_deep and COMPACT_DEEP_LANDING and BLOCKED_FUSE_PARENT_XOR
         self.compact_shallow_landing = compact_deep and COMPACT_SHALLOW_LANDING and BLOCKED_FUSE_PARENT_XOR
         self.compact_flow_exchange = compact_deep and COMPACT_FLOW_EXCHANGE
+        self.compact_fma_priority = self.compact_flow_exchange and COMPACT_FMA_PRIORITY
         self.compact_setup_deadline_cap = COMPACT_SETUP_DEADLINE_CAP if compact_deep else 4
         self.compact_depth3_gather_chunks = COMPACT_DEPTH3_GATHER_CHUNKS if self.compact_flow_exchange else 0
         self.compact_deep_select_delay = COMPACT_DEEP_SELECT_DELAY if self.compact_flow_exchange else 0

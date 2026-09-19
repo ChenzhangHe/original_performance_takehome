@@ -2921,3 +2921,130 @@ chain, and seek additional body work reductions with startup margin. Do not
 repeat whole-tail critical priority, second-pass exchange or zero-lag
 landing unchanged. Their scripts remain available for a genuinely changed
 body/control. A nominal900 compute floor is still not a900 execution.
+
+## Iteration40 — reserve scarce FMA capacity, 924 cycles (2026-09-19)
+
+Parent927 was committed and pushed as
+`ee87c658e6247232801432d7ab5a548d324c096d`, message
+`Reach 927 cycles with balanced startup dependency scheduling`, branch
+`optimize/kernel-v2` in `ChenzhangHe/original_performance_takehome`.
+All new source-transform probes pin that exact parent. This iteration's
+accepted result is **924 cycles / scratch1424**, three cycles faster. The
+iteration40 checkpoint bundles the verified implementation and research
+records for the user's requested commit/push. No external score submission
+was performed.
+
+### Accepted: schedule by execution eligibility
+
+The scalar ALU supports the ordinary vector binary operations lane by lane,
+but not fused multiply-add. After the existing ready-queue ordering and
+startup priority, stable-sort ready VALU operations so `multiply_add` comes
+first in fragmented policies. Other binary work can then use scalar capacity.
+This preserves all logical operations, dependencies, lanes and machine limits;
+only their legal issue choices change. The flag `COMPACT_FMA_PRIORITY` is
+gated by compact flow exchange; generic paths retain their old behavior.
+
+The minimal FMA-only preference wins924 with all236 policy candidates.
+Also prioritizing broadcasts takes925. The winner remains
+`fragment_adaptive_tail_hetero_360_240_240_220_900`. The exact integration
+comparison checks emitted instructions, logical slots/dependencies, issue
+and lane times, scratch allocation and all236 policy timings against the
+pinned prototype. Both enabled924 and disabled927 controls pass frozen
+seeds123/456/789, full-word memory, emission, provenance and address checks.
+
+| Metric | Parent927 | Accepted924 |
+| --- | ---: | ---: |
+| Scratch words | 1432 | 1424 |
+| Physical VALU slots | 5430 | 5417 |
+| Physical ALU slots | 10525 | 10629 |
+| Offloaded vector operations | 345 | 358 |
+| Fragmented vector operations | 237 | 285 |
+| Maximum fragment span, inclusive | 52 | 37 |
+| First / last flow issue | 14 / 901 | 14 / 898 |
+| Holes between first / last flow | 24 | 21 |
+| First / last body lookup | 53 / 916 | 54 / 913 |
+| Final gather-to-store drain | 10 | 10 |
+
+Unchanged: logical VALU5775 / ALU7765, weighted compute6745.625,
+load1783, flow864, store64,1664 body lookup loads,256 workspace fields
+representing248 distinct encoded nodes and five pruned constant loads.
+Thirteen more vector operations transfer104 lanes to scalar issue. The
+physical VALU-only floor is903; the optimistic combined floor is900 and
+the measured-startup-conditioned combined bound is903. These are necessary
+resource bounds, not achieved schedules. There are still24 cycles to900.
+
+Fresh production verification passes official9/9 at924, built-in3/3,
+32 frozen seeds1000..1031, eight full32-bit fixtures, exact primitive
+emission, physical scratch provenance, allocator boundaries, exhaustive
+workspace addresses and setup accounting. Six generic shapes retain
+72/150/350/751/590/1614 cycles; alternate path depths0/2/3 retain
+1013/1003/994, each checked with three seeds. An independent read-only review
+found no blockers. No official tests, simulator, capacities or data changed.
+
+### Tested alternatives: distinguish local waits from elapsed savings
+
+| Candidate | Policies | Cycles | Scratch | Why not promoted |
+| --- | --- | ---: | ---: | --- |
+| FMA and broadcast priority | 236 | 925 | 1424 | FMA-only is simpler and faster |
+| Force partial completion within1 cycle, no FMA priority | 3 | 928 | 1448 | Shorter waits, slower execution |
+| FMA+broadcast plus next-cycle partial completion | 236 | 924 | 1448 | Ties winner, more state/storage |
+| FMA-only plus next-cycle partial completion | 236 | 924 | 1424 | Ties winner, unnecessary complexity |
+| Dynamic late critical-chain feedback, two passes | 236 | 926 | 1432 | Slower than FMA-only |
+| That feedback combined with FMA-only | 236 | 924 | 1424 | No extra gain; original schedule retained |
+| Depth3 gathers wait for first4 shallow stores, not all8 | 236 | 926 | 1440 | Independent local win does not compose |
+| Narrow shallow stores plus FMA-only | 3 | 925 | 1424 | Screen already above924; not promoted |
+| Fetch both possible depth3 nodes, one landing bank | 3 | 935 | 1456 | Adds32 weighted equivalents and16 flow |
+| Same speculative prefetch, two landing banks | 3 | 935 | 1472 | Adds40 weighted equivalents and16 flow |
+
+All valid table candidates pass exact emission, physical provenance, frozen
+seeds123/456/789 and a full-word output/workspace fixture. Three-policy
+screens are explicitly not full-search scores. The shallow readiness probe
+narrows only the memory barrier: the depth3 padding table lies entirely in
+the first32 workspace words, written by the first four vstores. Unrelated
+remaining stores need not precede those gathers. No machine dependency is
+waived, but the combined schedule still loses to924.
+
+The two-child prefetch reads both possible depth3 nodes after depth1 parity,
+before depth2 hash completes. Each stride4 pair fits in an eight-word vload;
+overlapping loads land one candidate directly and scalar copies retain the
+other. It adds an address operation, a right-child copy and a select per
+exchanged group. Two banks require four more lane-merge copies per group.
+Atomic16-word spans and explicit address-read/write hazards are retained.
+Load count remains1783, but added work outweighs the earlier readiness.
+
+Tail feedback follows the real latest-producer chain from the final store,
+boosting at most one largest late ready-wait per pass. On927 it advances an
+initial MAC then its left affine arm, obtaining926. On924, the selected wait
+is only one lane of an eight-load gather. Boosting lane0 makes lane1 last;
+neither pass changes completion. Ready-wait totals and longest individual
+waits are not directly removable elapsed cycles. A future method must reason
+about all producers of the blocked consumer, not one arbitrary final lane.
+
+### Arithmetic research: exclude a broad constant-only escape route
+
+Pre-encoding all256 depth8 nodes needs32 setup XORs to remove32 body XORs,
+plus32 vloads and32 vstores. It fills the256-word workspace and displaces
+the existing records. Deeper levels are still more expensive. Switching
+the value state to raw merely moves the node XOR into the preceding hash's
+final decode. Neither yields net arithmetic savings by itself.
+
+A new SMT search asks if the existing final topology, two affine MAC arms
+joined by XOR and followed by a third MAC, can absorb the terminal constant.
+Grant arbitrary multipliers and biases for all three MACs and free adjustment
+of the existing stage1 XOR encoding. Fixed-arm subfamilies are UNSAT; the
+full32-bit query times out at30s and is inconclusive alone. However,96
+necessary low16-bit equations are UNSAT in14.392s (fresh rerun15.457s), excluding this entire
+32-bit topology with those arbitrary constants. A universal32-bit solution
+would have to satisfy those equations. Necessary parity restrictions lose
+no candidate; see `iteration40_encoding_results.md` for equations and scope.
+
+This is not a proof of globally optimal hash cost. It does mean future
+raw-output work must change topology/representation or find genuine reuse,
+not keep tuning constants in that family. The optional Z3 package is isolated
+outside the project; production has no solver dependency and no candidate
+from this search is claimed as a measured kernel.
+
+Next use924 as the control, investigate complete late consumer frontiers,
+and cost structural arithmetic changes before scheduling them. Detailed
+bounded controls live in the balance/tail/encoding result files. Reproduction
+commands are in `experiments/README.md`; no global-best claim is made.

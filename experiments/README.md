@@ -162,7 +162,7 @@ python3 experiments/iteration38_exchange_readiness.py --groups 16 17 18 19 20 21
 # Production controls and complete acceptance.
 python3 tune_kernel.py --compact-startup-groups 0 --compact-flow-exchange 0 --compact-shallow-landing 0 --compact-setup-deadline-cap 4 --seeds 123 456 789  # 941
 python3 tune_kernel.py --compact-startup-groups 0 --compact-flow-exchange 0 --seeds 123 456 789  # 940
-python3 tune_kernel.py --compact-startup-groups 0 --compact-deep-select-delay 0 1 --seeds 123 456 789  # 930/928
+python3 tune_kernel.py --compact-fma-priority 0 --compact-startup-groups 0 --compact-deep-select-delay 0 1 --seeds 123 456 789  # 930/928
 python3 verify_kernel.py --extra-shapes
 ```
 
@@ -199,10 +199,11 @@ python3 experiments/iteration39_compute.py --root-copy --full-policies
 python3 experiments/iteration39_readiness.py --root-input-arm --full-policies
 # Inspect flow holes and the tail producer chain on the baseline.
 python3 experiments/iteration39_readiness.py --inspect
-# Accepted two-group startup ancestry ordering, plus exact production match.
-python3 experiments/iteration39_readiness.py --bootstrap-dag 2 --bootstrap-critical --full-policies --compare-production
+# Accepted two-group startup ancestry ordering: pinned927 prototype.
+# --compare-production was valid at the927 checkpoint; current default is924.
+python3 experiments/iteration39_readiness.py --bootstrap-dag 2 --bootstrap-critical --full-policies
 # Production baseline/winner and comprehensive regression.
-python3 tune_kernel.py --compact-startup-groups 0 2 --seeds 123 456 789  # 928/927
+python3 tune_kernel.py --compact-fma-priority 0 --compact-startup-groups 0 2 --seeds 123 456 789  # 928/927
 python3 verify_kernel.py --extra-shapes
 ```
 
@@ -212,3 +213,56 @@ scratch provenance, frozen seeds and full-word memory. Its scheduler is
 probe-only. The compute probe extends its own dataflow access declaration
 for `flow.add_imm`; it does not bypass provenance checks. Neither diagnostic
 modifies engine capacities or treats scratch overflow as a valid score.
+
+## Iteration40: execution eligibility, 924 cycles
+
+New source transforms pin `ee87c658e6247232801432d7ab5a548d324c096d`, the
+pushed927 checkpoint. The accepted production change prioritizes ready
+FMA operations on VALU in fragmented policies, because scalar ALUs cannot
+execute them. More ordinary vectors use scalar lanes. No logical operations
+or dependencies change. Weighted compute remains6745.625; scratch is1424.
+Production imports none of the probe modules.
+
+```sh
+# Full pinned-source control927 and minimal winner924.
+python3 -B experiments/iteration40_balance.py --full-policies
+python3 -B experiments/iteration40_balance.py --valu-fma --fma-mode only_fma --full-policies
+# Exact production/pinned comparison, flag both enabled and disabled.
+python3 -B experiments/iteration40_balance_acceptance.py
+python3 -B tune_kernel.py --compact-fma-priority 0 1 --seeds 123 456 789  # 927/924
+
+# Independent readiness win926, not an additive gain on top of924.
+python3 -B experiments/iteration40_prefetch.py --full-policies
+# Two-child speculative reads: both935 in three-policy screens; more work.
+python3 -B experiments/iteration40_prefetch.py --pair-prefetch --banks 1
+python3 -B experiments/iteration40_prefetch.py --pair-prefetch --banks 2
+# Actual latest-producer chain; two-pass feedback926, combined still924.
+python3 -B experiments/iteration40_tail.py --inspect
+python3 -B experiments/iteration40_tail.py --feedback-passes 2 --feedback-gain 240 --feedback-min-round 10 --full-policies
+python3 -B experiments/iteration40_tail.py --feedback-passes 2 --feedback-gain 240 --feedback-min-round 10 --mac-first --full-policies
+
+# Research only, optional z3-solver==4.15.4.0 on PYTHONPATH.
+# Low16-bit UNSAT excludes the explicitly defined constant-only template,
+# not every possible shorter hash. The full32 query alone timed out.
+python3 -B experiments/iteration40_encoding_state.py --seconds 30 --free-arms
+python3 -B experiments/iteration40_encoding_state.py --seconds 30 --truncated 16
+
+# Fresh current-production acceptance; no optional solver needed.
+python3 -B tests/submission_tests.py
+python3 -B perf_takehome.py
+python3 -B verify_kernel.py --extra-shapes
+```
+
+Accepted production passes official9/9, built-in3/3,32 frozen seeds,eight
+full-word fixtures, emission/provenance, allocator/workspace checks and all
+extra shapes/path depths. Each retained kernel probe checks at least three
+frozen seeds, full-word memory, exact emission and physical provenance.
+Full means236 existing policies; three-policy screens remain labeled as
+such. Feedback pass lengths are intermediate diagnostics; only the retained,
+allocated schedule is validated and reported as the candidate.
+
+The three result files `iteration40_balance_results.md`,
+`iteration40_tail_results.md` and `iteration40_encoding_results.md` contain
+the detailed controls and limits. Iteration40 in the main log additionally
+records the speculative-read cost accounting and shallow-store dependency
+probe. No extra completion policy or hash rewrite entered production.
