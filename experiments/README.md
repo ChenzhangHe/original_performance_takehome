@@ -160,9 +160,9 @@ python3 experiments/iteration38_exchange.py --groups 16 17 18 19 20 21 22 23 24 
 python3 experiments/iteration38_exchange_readiness.py --groups 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 --variants select_late --full-policies
 
 # Production controls and complete acceptance.
-python3 tune_kernel.py --compact-flow-exchange 0 --compact-shallow-landing 0 --compact-setup-deadline-cap 4 --seeds 123 456 789  # 941
-python3 tune_kernel.py --compact-flow-exchange 0 --seeds 123 456 789  # 940
-python3 tune_kernel.py --compact-deep-select-delay 0 1 --seeds 123 456 789  # 930/928
+python3 tune_kernel.py --compact-startup-groups 0 --compact-flow-exchange 0 --compact-shallow-landing 0 --compact-setup-deadline-cap 4 --seeds 123 456 789  # 941
+python3 tune_kernel.py --compact-startup-groups 0 --compact-flow-exchange 0 --seeds 123 456 789  # 940
+python3 tune_kernel.py --compact-startup-groups 0 --compact-deep-select-delay 0 1 --seeds 123 456 789  # 930/928
 python3 verify_kernel.py --extra-shapes
 ```
 
@@ -172,3 +172,43 @@ gathers. Node values and addresses are computed by emitted runtime code;
 there is no answer precomputation. The group choice affects readiness:
 16 high groups are faster than16 middle groups despite identical counts.
 Do not equate the new aggregate compute floor900 with an achieved900 score.
+
+## Iteration39: test remaining readiness/work hypotheses against928
+
+All four probes pin `161c60200be0aa071532f6784817a5b562e9c2c8`, the pushed
+928 baseline. None imports its generated kernel into production or changes
+the official simulator. Most candidates are negative controls; two-group
+startup ancestry priority wins927. Reduced local operation counts or chain
+latency are not accepted scores by themselves.
+
+```sh
+# Move eight of the16 exchange groups to the second traversal: 930 screen.
+python3 experiments/iteration39_exchange.py --early-start 24 --early-count 8 --late-start 24 --late-count 8
+# 18 early groups: 930 full policies (not a gain from fewer flow slots).
+python3 experiments/iteration39_exchange.py --early-start 14 --early-count 18 --full-policies
+# Split12/4 across traversals: 930 full policies, two extra bias constants.
+python3 experiments/iteration39_exchange.py --early-start 20 --early-count 12 --late-start 28 --late-count 4 --full-policies
+
+# Legal start-cycle reader/end-cycle overwrite overlap: 929, not928.
+python3 experiments/iteration39_landing_overlap.py --depths 4 6 --full-policies
+# Move24 input-address ALU ops to flow.add_imm: work-3, but929.
+python3 experiments/iteration39_compute.py --inputs 32 --full-policies
+# Remove one setup root copy: ties928, only0.125 compute-equivalent saving.
+python3 experiments/iteration39_compute.py --root-copy --full-policies
+# Same-work cross-root XOR reassociation: 930.
+python3 experiments/iteration39_readiness.py --root-input-arm --full-policies
+# Inspect flow holes and the tail producer chain on the baseline.
+python3 experiments/iteration39_readiness.py --inspect
+# Accepted two-group startup ancestry ordering, plus exact production match.
+python3 experiments/iteration39_readiness.py --bootstrap-dag 2 --bootstrap-critical --full-policies --compare-production
+# Production baseline/winner and comprehensive regression.
+python3 tune_kernel.py --compact-startup-groups 0 2 --seeds 123 456 789  # 928/927
+python3 verify_kernel.py --extra-shapes
+```
+
+The overlap probe certifies every zero-lag edge is WAR-only, preserves
+strict RAW/WAW dependencies, and additionally checks emission, physical
+scratch provenance, frozen seeds and full-word memory. Its scheduler is
+probe-only. The compute probe extends its own dataflow access declaration
+for `flow.add_imm`; it does not bypass provenance checks. Neither diagnostic
+modifies engine capacities or treats scratch overflow as a valid score.

@@ -2812,3 +2812,112 @@ holes, load readiness and ten-cycle tail on the cheaper graph.
 Reproduction: see `experiments/README.md` iteration38. Every probe pins941;
 production imports none of them. No leaderboard lookup or external
 submission occurred, so928 is our local best, not a claimed global record.
+
+## Iteration39 — push928, then trace startup and the laggard (2026-09-18)
+
+First, commit and push the fully verified iteration38 implementation:
+`161c60200be0aa071532f6784817a5b562e9c2c8`, message
+`Reach 928 cycles through shallow landing and flow exchange`, user fork
+`ChenzhangHe/original_performance_takehome`, branch `optimize/kernel-v2`.
+Local HEAD and the remote-tracking branch match. Fresh official9/9 confirms
+928. Every iteration39 experiment pins that commit; no official test,
+simulator, instruction capacity or input data is changed.
+
+The next accepted implementation is **927 cycles / scratch1432**, with identical
+logical operations and dependencies. Two-group startup ancestry priority
+wins one elapsed cycle. Production passes official9/9, built-in3/3,32 frozen
+seeds,eight full-word fixtures,exact emission/provenance,workspace address
+and allocator boundary checks,six extra shapes and three alternate path
+depths. The iteration39 checkpoint bundles this927 implementation and its
+research records; a fresh pre-commit official9/9 run again confirms927.
+
+### Diagnose actual producers, not just engine totals
+
+On928,16 of the20 flow holes occur between62 and131; the remaining four
+are898..901. The critical late chain belongs to chunk0: round13 hash,
+the last depth3 select at902, round14 hash/address construction, final
+depth4 gather at917, then ten tightly dependent hash/store cycles ending
+at927. The drain itself has no late issue stalls to delete. Bring forward
+its input producer chain rather than removing legitimate dependencies.
+
+Blanket bottom-level critical priority starting at850 takes943 (at800,
+959). Boosting low groups' late compute ties928 or regresses929. Input-load
+bootstrap alone takes930, because it delays the shared root forest-load
+chain; prioritizing a leaf of the startup DAG is insufficient. Short
+flow-distance urgency also takes929. These are bounded hypothesis tests,
+not an unbounded search over scheduling weights.
+
+### Accepted direction: balance two complete startup paths
+
+Find the first round1 vselect for each of the highest TWO groups and collect
+its transitive producer ancestors. Compute each ancestor's longest distance
+to those selected targets. After the existing ready-queue ordering, stable
+sort by `(is_startup_ancestor, distance_to_target)` to finish the longer
+required startup paths first. All capacity checks and strict dependencies
+are unchanged. After those ancestors finish, the original ordering remains.
+
+Starting one group this way moves its first flow19→13, proving that19 was
+only a conditional bound, not a hardware minimum. But it creates more later
+flow holes and takes930 in the screen. Starting two groups is more balanced:
+first flow14,24 holes, and927 total cycles with the complete236-policy set.
+This is a one-cycle win, not a five-cycle win from startup alone. It retains
+the prior winning policy `fragment_adaptive_tail_hetero_360_240_240_220_900`.
+Logical counts remain load1783, VALU5775, ALU7765, flow864, store64, weighted
+compute6745.625. The hash and all address/layout formulas are unchanged.
+
+Final physical counts: load1783, VALU5430, ALU10525, flow864, store64.
+Offloaded345 vector operations,237 fragmented, maximum span52; scratch1432.
+First/last flow14/901, first/last lookup53/916, lookup count1664 and drain10.
+The optimistic aggregate compute floor remains900; its startup-conditioned
+bound is903 on this schedule (first VALU3, first ALU2). These are necessary
+bounds, not an attainable900 schedule or an elapsed-performance predictor.
+
+The production control is `COMPACT_STARTUP_GROUPS=0` for928 and2 for927.
+Both production modes pass seeds123/456/789; the winner exactly matches
+the fixed-parent prototype's instructions, logical slots, dependencies and
+scratch allocation. `git diff --check` passes.
+The new rule is restricted to the compact scored path; generic shapes keep
+their old behavior. Preserve this changed readiness graph as the next
+control rather than claiming any of the rejected local savings add to it.
+
+### Negative controls: cheaper or locally faster did not win
+
+| Hypothesis | Policies | Cycles | Scratch | Work / reason |
+| --- | --- | ---: | ---: | --- |
+| All16 exchange groups moved to second traversal | 4 | 945 | 1416 | +2 setup equivalents |
+| Exchange8 early +8 late, highest groups | 4 | 930 | 1440 | +2 setup equivalents |
+| Exchange8 early highest,8 late preceding groups | 4 | rejected | 1560 | exceeds1536; no valid score |
+| Exchange12 early +4 late, highest groups | full | 930 | 1440 | same flow864, two extra loads/broadcasts |
+| Exchange14 early +2 late, highest groups | full | 930 | 1512 | same flow864, two extra loads/broadcasts |
+| Exchange18 early groups | full | 930 | 1424 | work unchanged, loads1799 |
+| Legal zero-lag shallow landing WAR | full | 929 | 1424 | work unchanged |
+| Legal zero-lag deep landing WAR | full | 929 | 1432 | work unchanged |
+| Legal zero-lag both landing WAR | full | 929 | 1424 | 877 of896 WAR edges overlap |
+| All24 input-address ALUs → flow.add_imm | full | 929 | 1440 | work-3, flow+24 |
+| First16 setup increments → constant loads | full | 930 | 1424 | work-2, loads+16 |
+| Root encoding writes retained scalar directly | full | 928 | 1440 | only one ALU removed |
+| Move round11 root XOR into round10 hash arm | full | 930 | 1504 | same work, shorter cross-root chain |
+| Add depth3 lane-tail release | full | 929 | 1408 | no elapsed win |
+
+All valid rows pass exact primitive emission, physical scratch provenance,
+frozen seeds123/456/789 and a full32-bit output/workspace fixture. Full means
+all236 existing policy candidates. The overlap experiment separately proves
+each zero-lag edge is WAR-only, retains strict prior-vload WAW, and checks
+there are no same-cycle physical double writes. It changes neither the
+allocator nor the official machine. Hundreds of genuine local overlaps
+still fail to improve end-to-end throughput, so that scheduler complexity
+is not promoted into production.
+
+The flow.add_imm probe uses the original ISA and an explicit one-read/
+one-write provenance declaration. Its immediate is not a scratch address.
+Its new early flow instructions mean the old first-vselect19 cannot be
+applied blindly as the first-issue bound for ALL flow slots in that variant.
+All setup constant-load substitutions use input-independent addresses,
+never tree values or expected answers. See `iteration39_compute_results.md`
+for its complete local-resource table.
+
+Next: evaluate balanced startup together with the laggard's real producer
+chain, and seek additional body work reductions with startup margin. Do not
+repeat whole-tail critical priority, second-pass exchange or zero-lag
+landing unchanged. Their scripts remain available for a genuinely changed
+body/control. A nominal900 compute floor is still not a900 execution.

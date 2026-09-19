@@ -78,6 +78,7 @@ COMPACT_SETUP_DEADLINE_CAP = 6
 COMPACT_FLOW_EXCHANGE = True
 COMPACT_DEPTH3_GATHER_CHUNKS = 16
 COMPACT_DEEP_SELECT_DELAY = 1
+COMPACT_STARTUP_GROUPS = 2  # Zero restores the pre-bootstrap schedule.
 
 
 class KernelBuilder:
@@ -240,6 +241,33 @@ class KernelBuilder:
                     bottom_level[succ] for succ in successors[op_id]
                 )
 
+        # Bootstrap a small cohort through its first tree select. Prioritizing
+        # input loads alone delays the root/constants they need; prioritize the
+        # complete ancestor DAG by distance to the target instead. This changes
+        # only ready-queue order, never an instruction or a dependency.
+        startup_dag = set()
+        startup_groups = getattr(self, "compact_startup_groups", 0)
+        if startup_groups:
+            targets = {}
+            for op_id, op in enumerate(ops):
+                if (not op.get("is_setup", False) and op["round"] == 1
+                        and op["engine"] == "flow" and op["slot"][0] == "vselect"):
+                    chunk = op["chunk"]
+                    if chunk not in targets or op["local_seq"] < ops[targets[chunk]]["local_seq"]:
+                        targets[chunk] = op_id
+            assert len(targets) >= startup_groups
+            todo = [targets[chunk] for chunk in sorted(targets, reverse=True)[:startup_groups]]
+            while todo:
+                op_id = todo.pop()
+                if op_id not in startup_dag:
+                    startup_dag.add(op_id)
+                    todo.extend(ops[op_id]["deps"])
+        startup_distance = [0] * len(ops)
+        for op_id in reversed(topological):
+            if op_id in startup_dag:
+                for dep in ops[op_id]["deps"]:
+                    startup_distance[dep] = max(startup_distance[dep], startup_distance[op_id] + 1)
+
         def priority(policy, op_id):
             fanout = len(successors[op_id])
             unlocks_load = any(ops[succ]["engine"] == "load" for succ in successors[op_id])
@@ -340,6 +368,10 @@ class KernelBuilder:
                         )
                     else:
                         candidates.sort(key=priorities.__getitem__, reverse=True)
+                    if startup_dag:
+                        # Stable sorting preserves every existing policy's
+                        # ordering among operations outside the startup DAG.
+                        candidates.sort(key=lambda i: (i in startup_dag, startup_distance[i]), reverse=True)
                     capacity = SLOT_LIMITS[engine]
                     # Reserve a whole eight-lane group before scalar issue
                     # when its ready queue is short. This avoids fragmenting
@@ -551,7 +583,9 @@ class KernelBuilder:
         self.compact_setup_deadline_cap = COMPACT_SETUP_DEADLINE_CAP if compact_deep else 4
         self.compact_depth3_gather_chunks = COMPACT_DEPTH3_GATHER_CHUNKS if self.compact_flow_exchange else 0
         self.compact_deep_select_delay = COMPACT_DEEP_SELECT_DELAY if self.compact_flow_exchange else 0
+        self.compact_startup_groups = COMPACT_STARTUP_GROUPS if self.compact_flow_exchange else 0
         assert 0 <= COMPACT_DEPTH3_GATHER_CHUNKS <= chunk_count or not compact_deep
+        assert 0 <= self.compact_startup_groups <= chunk_count
         assert self.compact_setup_deadline_cap >= 0 and COMPACT_DEEP_SELECT_DELAY >= 0
         assert BLOCKED_REVERSE_INPUT_CHAIN_LENGTH >= 0
         self.blocked_reverse_input_chain_length = BLOCKED_REVERSE_INPUT_CHAIN_LENGTH if blocked_lookup else 0

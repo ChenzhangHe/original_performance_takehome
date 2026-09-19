@@ -1,6 +1,51 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
-Latest accepted implementation: iteration38, **928 cycles**, scratch **1,440/1,536**,
+Latest accepted implementation, iteration39 (2026-09-18): **927 cycles**, scratch
+**1,432/1,536**, unchanged work6745.625. The928 baseline was committed and
+pushed as `161c60200be0aa071532f6784817a5b562e9c2c8` to the user's fork on
+`optimize/kernel-v2`. This checkpoint bundles the927 implementation and
+research records. All new isolated probes pin the pushed928 source.
+Official9/9,built-in3/3,32 frozen seeds,eight full-word fixtures,provenance,
+allocator/workspace checks and all extra shapes/path depths pass.
+
+Prioritize the complete ancestor DAG of the highest TWO groups' first
+round1 vselects, ordered by longest remaining distance to those targets.
+Do not merely prioritize their input loads. This changes neither operations
+nor dependencies. First flow moves19→14; flow ends901 rather than902,
+last gather916 rather than917, and completion926 rather than927. There are
+24 flow holes instead of20: most of the earlier start is absorbed by later
+waiting, so the elapsed win is one cycle, not five. Starting one group can
+move first flow to13 but still takes930. Thus19 was never a hardware minimum.
+`--compact-startup-groups 0` restores928;2 enables927. Generic paths and
+the exchange-disabled control retain their prior scheduling behavior.
+Physical slots are load1783, VALU5430, ALU10525, flow864, store64. The ideal
+aggregate compute floor remains900, but the startup-conditioned bound for
+this schedule is903. No900-cycle execution or global-best score is claimed.
+
+The late trace is more specific now: the last group's round13 hash feeds
+the final depth3 select at902, round14 hash/address construction, last
+depth4 gather at917, and hash/store completion at927. The ten-cycle drain
+itself has no late scheduling stalls to remove; advance its producer chain.
+Of the20 flow holes,16 are early (62..131) and four are at898..901. This
+does not mean20 removable elapsed cycles: other engines keep working.
+
+Rejected on the new graph: exchanging loads/flow in the second traversal
+takes930–945;18 first-traversal exchange groups take930 with all policies.
+Legal zero-lag landing WAR takes929 despite overlapping877 reader/writer
+edges. Moving all24 input-address ALU operations to flow.add_imm removes3
+compute equivalents but takes929 and raises flow to888; those extra slots
+must still fit around select readiness. Cross-root XOR reassociation takes930.
+Do not promote these local savings without an end-to-end gain.
+
+Next use the balanced927 startup as the control, then address the laggard's
+real producer chain or remove further body work with startup margin. More
+exchange groups, blanket critical-path priority, and input bootstrap alone
+have been tested and are not demonstrated improvements. Do not assume
+independent local savings add together. See iteration39 in the log and the
+pinned scripts for reproducible evidence and exact production comparison.
+
+The following budget describes the pushed iteration38 baseline, **928 cycles**,
+scratch **1,440/1,536**,
 parent `34742f6` (941). This is a **13-cycle** improvement. Official9/9,
 built-in3/3,32 frozen seeds,eight full-word fixtures,emission/provenance,
 allocator boundaries and six extra shapes/three alternate path depths pass.
@@ -50,7 +95,8 @@ Next, in order:
 
 Workspace contains256 encoded fields representing248 distinct nodes;
 there are no zero padding words. Header/forest remain untouched. The hash
-is unchanged. No leaderboard query, benchmark submission, commit or push.
+is unchanged. No leaderboard query or benchmark submission. The928 baseline
+has since been committed and pushed as noted above.
 See iteration38 in the log for formulas, A/B and reproduction commands.
 
 The implementation status below is historical.
