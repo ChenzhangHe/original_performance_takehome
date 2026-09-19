@@ -80,6 +80,7 @@ COMPACT_DEPTH3_GATHER_CHUNKS = 16
 COMPACT_DEEP_SELECT_DELAY = 1
 COMPACT_STARTUP_GROUPS = 2  # Zero restores the pre-bootstrap schedule.
 COMPACT_FMA_PRIORITY = True
+COMPACT_INPUT_IMMEDIATE = True
 
 
 class KernelBuilder:
@@ -587,6 +588,7 @@ class KernelBuilder:
         self.compact_shallow_landing = compact_deep and COMPACT_SHALLOW_LANDING and BLOCKED_FUSE_PARENT_XOR
         self.compact_flow_exchange = compact_deep and COMPACT_FLOW_EXCHANGE
         self.compact_fma_priority = self.compact_flow_exchange and COMPACT_FMA_PRIORITY
+        self.compact_input_immediate = self.compact_flow_exchange and COMPACT_INPUT_IMMEDIATE
         self.compact_setup_deadline_cap = COMPACT_SETUP_DEADLINE_CAP if compact_deep else 4
         self.compact_depth3_gather_chunks = COMPACT_DEPTH3_GATHER_CHUNKS if self.compact_flow_exchange else 0
         self.compact_deep_select_delay = COMPACT_DEEP_SELECT_DELAY if self.compact_flow_exchange else 0
@@ -1131,7 +1133,12 @@ class KernelBuilder:
                 emit_context.update(chunk=chunk_no, round=0, local_seq=0)
             anchor = ((chunk_no == chunk_count-1 or (chunk_no+1) % chain_length == 0)
                       if reverse_inputs else chunk_no % chain_length == 0)
-            if anchor:
+            if self.compact_input_immediate:
+                # Spend initial flow capacity on independent layout addresses.
+                # This scratch word starts at zero and is never written.
+                ready = emit("flow", ("add_imm", input_addrs + chunk_no, readonly_zero,
+                                      inp_values_p + chunk_no * VLEN))
+            elif anchor:
                 ready = emit("load", ("const", input_addrs + chunk_no,
                                       inp_values_p + chunk_no * VLEN))
             else:

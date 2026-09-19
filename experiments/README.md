@@ -162,7 +162,7 @@ python3 experiments/iteration38_exchange_readiness.py --groups 16 17 18 19 20 21
 # Production controls and complete acceptance.
 python3 tune_kernel.py --compact-startup-groups 0 --compact-flow-exchange 0 --compact-shallow-landing 0 --compact-setup-deadline-cap 4 --seeds 123 456 789  # 941
 python3 tune_kernel.py --compact-startup-groups 0 --compact-flow-exchange 0 --seeds 123 456 789  # 940
-python3 tune_kernel.py --compact-fma-priority 0 --compact-startup-groups 0 --compact-deep-select-delay 0 1 --seeds 123 456 789  # 930/928
+python3 tune_kernel.py --compact-input-immediate 0 --compact-fma-priority 0 --compact-startup-groups 0 --compact-deep-select-delay 0 1 --seeds 123 456 789  # 930/928
 python3 verify_kernel.py --extra-shapes
 ```
 
@@ -203,7 +203,7 @@ python3 experiments/iteration39_readiness.py --inspect
 # --compare-production was valid at the927 checkpoint; current default is924.
 python3 experiments/iteration39_readiness.py --bootstrap-dag 2 --bootstrap-critical --full-policies
 # Production baseline/winner and comprehensive regression.
-python3 tune_kernel.py --compact-fma-priority 0 --compact-startup-groups 0 2 --seeds 123 456 789  # 928/927
+python3 tune_kernel.py --compact-input-immediate 0 --compact-fma-priority 0 --compact-startup-groups 0 2 --seeds 123 456 789  # 928/927
 python3 verify_kernel.py --extra-shapes
 ```
 
@@ -229,7 +229,7 @@ python3 -B experiments/iteration40_balance.py --full-policies
 python3 -B experiments/iteration40_balance.py --valu-fma --fma-mode only_fma --full-policies
 # Exact production/pinned comparison, flag both enabled and disabled.
 python3 -B experiments/iteration40_balance_acceptance.py
-python3 -B tune_kernel.py --compact-fma-priority 0 1 --seeds 123 456 789  # 927/924
+python3 -B tune_kernel.py --compact-input-immediate 0 --compact-fma-priority 0 1 --seeds 123 456 789  # 927/924
 
 # Independent readiness win926, not an additive gain on top of924.
 python3 -B experiments/iteration40_prefetch.py --full-policies
@@ -266,3 +266,61 @@ The three result files `iteration40_balance_results.md`,
 the detailed controls and limits. Iteration40 in the main log additionally
 records the speculative-read cost accounting and shallow-store dependency
 probe. No extra completion policy or hash rewrite entered production.
+
+## Iteration41: independent input addresses, 923 cycles, a stronger budget
+
+All source transforms pin `109610180033baa744a0fe80a2501e1ba2f73b00`, the
+pushed924 checkpoint. The accepted change materializes32 layout-derived
+input addresses with original-ISA flow.add_imm, deleting eight constant
+loads and24 scalar increments. Full236-policy confirmation and production
+acceptance give923/scratch1416. The hash and record layout are unchanged.
+
+```sh
+# Accepted address transform and exact integrated on/off equivalence.
+python3 -B experiments/iteration41_transfer.py --inputs-immediate --full-policies
+python3 -B experiments/iteration41_transfer_acceptance.py
+python3 -B tune_kernel.py --compact-input-immediate 0 1 --seeds 123 456 789  # 924/923
+
+# Correct negative address controls:924,924 and927 screen respectively.
+python3 -B experiments/iteration41_transfer.py --root alias --full-policies
+python3 -B experiments/iteration41_transfer.py --inputs-flow --full-policies
+python3 -B experiments/iteration41_transfer.py --anchor-immediate
+
+# Complete consumer-frontier priority:925; deadline version ties924.
+python3 -B experiments/iteration41_frontier.py --scope entry --full-policies --inspect
+python3 -B experiments/iteration41_frontier.py --scope join --mode deadline --full-policies
+# Lane input-XOR fusion and FMA fairness: no gain over their controls.
+python3 -B experiments/iteration41_gather_fusion.py --scope raw --full-policies
+python3 -B experiments/iteration41_gather_fusion.py --scope all --early-decode --full-policies
+python3 -B experiments/iteration41_fma_fairness.py --enabled --inputs-immediate --full-policies
+
+# Optional z3-solver==4.15.4.0 on PYTHONPATH, not a production dependency.
+python3 -B experiments/iteration41_hash_topology.py --seconds 12
+python3 -B experiments/iteration41_hash_parity.py --proof-only
+# Proven parity identity, but runtime combination only ties923; not adopted.
+python3 -B experiments/iteration41_hash_parity.py --groups 0 --rounds 14 --late-constants --inputs-immediate --full-policies
+
+# Fixed-graph resource+output-tail certificate; --details prints paths.
+python3 -B experiments/iteration41_resource_tails.py --inputs-immediate  # flow>=910, strict load>=898
+python3 -B experiments/iteration41_resource_tails.py                     # old924: flow>=878, strict load>=902
+
+python3 -B tests/submission_tests.py
+python3 -B perf_takehome.py
+python3 -B verify_kernel.py --extra-shapes
+```
+
+The stronger bound is the key next-step constraint: all896 flow operations
+in923 retain at least15 operations on a path to an output store, including
+the flow operation. Capacity1 implies895+15=910 elapsed cycles, even after
+relaxing to direct scratch-RAW dependencies. This is a certificate for this
+operation/resource graph, not a claim that every algorithm needs910 cycles.
+The relaxed graph omits memory dependencies and must not be executed. More
+priority sweeps alone cannot turn this graph into900.
+
+Detailed bounded results are in `iteration41_transfer_results.md`,
+`iteration41_frontier_results.md`, `iteration41_issue_results.md` and
+`iteration41_hash_results.md`. All retained runtime probes validate exact
+emission/dependencies/capacity, scratch provenance, three frozen seeds and
+full-word output/workspace; full means236 policies. Accepted production has
+the broader official9/9, built-in3/3,32-seed/eight-fixture and extra-shape
+coverage. No official tests or machine semantics changed.

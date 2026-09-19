@@ -65,11 +65,12 @@ def main():
         "COMPACT_DEPTH3_GATHER_CHUNKS", "COMPACT_DEEP_SELECT_DELAY",
         "COMPACT_STARTUP_GROUPS",
         "COMPACT_FMA_PRIORITY",
+        "COMPACT_INPUT_IMMEDIATE",
     ):
         parser.add_argument("--" + name.lower().replace("_", "-"), type=int, nargs="+", default=[getattr(kernel, name)])
     parser.add_argument("--seeds", type=int, nargs="+", default=[123])
     args = parser.parse_args()
-    for hash_chunks, bit_mask_chunks, path_depth, cache_chunks, direct_depth, backlog, reserve_start, final_cache_chunks, address_chain, preencode_depth, input_priority, fragment_issue, direct_addresses, blocked, read_banks, blocked_final_cache, fuse_parent, fuse_setup, setup_deadlines, early_tail, drop_weight, encode_depth6, reverse_chain, tail_start, compact_deep, lane_tail, parent_index_select, deep_landing, shallow_landing, setup_cap, flow_exchange, depth3_gather_chunks, deep_select_delay, startup_groups, fma_priority in product(
+    for hash_chunks, bit_mask_chunks, path_depth, cache_chunks, direct_depth, backlog, reserve_start, final_cache_chunks, address_chain, preencode_depth, input_priority, fragment_issue, direct_addresses, blocked, read_banks, blocked_final_cache, fuse_parent, fuse_setup, setup_deadlines, early_tail, drop_weight, encode_depth6, reverse_chain, tail_start, compact_deep, lane_tail, parent_index_select, deep_landing, shallow_landing, setup_cap, flow_exchange, depth3_gather_chunks, deep_select_delay, startup_groups, fma_priority, input_immediate in product(
         args.hash_alu_chunks, args.bit_mask_valu_chunks, args.path_reuse_depth,
         args.depth4_cache_chunks, args.direct_path_depth, args.alu_vector_backlog,
         args.alu_vector_reserve_start,
@@ -89,6 +90,7 @@ def main():
         args.compact_depth3_gather_chunks, args.compact_deep_select_delay,
         args.compact_startup_groups,
         args.compact_fma_priority,
+        args.compact_input_immediate,
     ):
         kernel.HASH_ALU_CHUNKS = hash_chunks
         kernel.BIT_MASK_VALU_CHUNKS = bit_mask_chunks
@@ -125,6 +127,7 @@ def main():
         kernel.COMPACT_DEEP_SELECT_DELAY = deep_select_delay
         kernel.COMPACT_STARTUP_GROUPS = startup_groups
         kernel.COMPACT_FMA_PRIORITY = bool(fma_priority)
+        kernel.COMPACT_INPUT_IMMEDIATE = bool(input_immediate)
         start = time.perf_counter()
         builder = kernel.KernelBuilder()
         builder.build_kernel(10, 2047, 256, 16)
@@ -167,6 +170,7 @@ def main():
                               compact_deep_select_delay=builder.compact_deep_select_delay,
                               compact_startup_groups=builder.compact_startup_groups,
                               compact_fma_priority=builder.compact_fma_priority,
+                              compact_input_immediate=builder.compact_input_immediate,
                               cycles=cycles, scratch=builder.scratch_ptr, policy=builder.schedule_policy,
                               slots=dict(slots), checked_seeds=args.seeds, build_seconds=round(elapsed, 3))), flush=True)
 

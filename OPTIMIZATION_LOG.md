@@ -3048,3 +3048,146 @@ Next use924 as the control, investigate complete late consumer frontiers,
 and cost structural arithmetic changes before scheduling them. Detailed
 bounded controls live in the balance/tail/encoding result files. Reproduction
 commands are in `experiments/README.md`; no global-best claim is made.
+
+## Iteration41 — push924, independent input addresses reach923 (2026-09-19)
+
+At the user's request, commit and push the fully verified iteration40
+checkpoint first: `109610180033baa744a0fe80a2501e1ba2f73b00`, message
+`Reach 924 cycles with FMA-aware vector scheduling`, branch
+`optimize/kernel-v2` in `ChenzhangHe/original_performance_takehome`.
+Fresh official9/9 again confirms924. HEAD and origin match and the tree was
+clean before new research. All iteration41 source probes pin this commit.
+
+The new accepted result is **923 cycles / scratch1416**, one cycle faster.
+The iteration41 checkpoint bundles this verified implementation, research
+records and resource-tail certificate for the user's requested commit/push.
+A fresh pre-commit official9/9 run confirms923. No external score submission
+or leaderboard lookup occurred.
+
+### Accepted: independent flow input addresses
+
+The old address generator has eight load.const anchors and24 scalar ALU
+increments in descending four-address chains. Emit32 independent original
+`flow.add_imm` instructions from the retained readonly-zero word instead.
+Every immediate is the exact layout-derived address `inp_values_p+8*chunk`;
+it does not encode input/tree values or expected answers. Each input vload
+and final output vstore retains its own address-ready dependency.
+
+This replaces, rather than adds to, the old generator: load−8, ALU−24,
+flow+32, weighted arithmetic−3. Breaking the chains matters. Merely moving
+24 increments onto flow ties924; replacing only the eight anchors with
+flow immediates while retaining24 ALUs regresses to927 in the three-policy
+screen. Both are correct but neither is the accepted923 implementation.
+
+| Metric | Pushed924 | Local923 |
+| --- | ---: | ---: |
+| Scratch | 1424 | 1416 |
+| Total load / flow slots | 1783 / 864 | 1775 / 896 |
+| Physical VALU / ALU slots | 5417 / 10629 | 5414 / 10629 |
+| Weighted compute | 6745.625 | 6742.625 |
+| First VALU / ALU issue | 3 / 2 | 1 / 2 |
+| First / last flow issue | 14 / 898 | 0 / 896 |
+| Holes within flow span | 21 | 1 |
+| First / last body lookup | 54 / 913 | 51 / 912 |
+| Last gather-to-store drain | 10 | 10 |
+
+Logical VALU stays5775; logical ALU is7741. Stores remain64, body lookups1664,
+workspace256 fields/248 distinct nodes. There are361 offloaded vectors,
+275 fragmented, maximum inclusive span48. The winning policy is unchanged:
+`fragment_adaptive_tail_hetero_360_240_240_220_900`, all236 policies tried.
+First flow0 now means address generation, not a tree selection at cycle0.
+
+Production gates `COMPACT_INPUT_IMMEDIATE` by compact flow exchange.
+Disabling it exactly restores924. Generic shapes and alternate path depths
+retain prior behavior. The local provenance verifier now understands
+`flow.add_imm`: destination is a write, source is a read, immediate is not a
+scratch operand. Positive and deliberately mis-mapped source/destination
+fixtures check this rule. Both logical and physical write-set audits prove
+the readonly-zero word is never overwritten; simulator scratch starts zero.
+
+Exact on/off integration matches pinned probes in every instruction,
+logical slot, dependency, first/final issue, lane time, scratch allocation
+and all236 policy timings. Each of the four builds passes three frozen
+seeds, full-word memory, emission/provenance and workspace checks. Fresh
+production passes official9/9, built-in3/3,32 frozen seeds,eight full-word
+fixtures, allocator/setup/address checks, six generic shapes and three
+alternate path depths. Independent read-only review found no blocker.
+The old iteration40 acceptance test explicitly disables this new flag and
+still exactly reproduces927/924. No official test or simulator was modified.
+
+### New lower bound:900 needs a graph change, not only a better scheduler
+
+For each logical operation, compute its longest strict dependency path to
+an output store, inclusive of both endpoints. For engine capacity c, sort
+its output-reaching tails descending as b[k]. Among the first k operations,
+one must issue at or after `ceil(k/c)-1`, and still has at least b[k] unit
+operations on a path to the output. Thus:
+
+`cycles >= max_k(ceil(k/c)-1+b[k])`.
+
+Only apply fixed-engine counts to flow/load, not logical VALU/ALU which can
+be reassigned through scalar offload. Treating any fragmented operation as
+one cycle is optimistic and cannot invalidate this necessary bound.
+
+On923, all896 flow operations reach final outputs. Their minimum tail is15,
+so **flow gives910**, attained by the formula at k896:895+15. Strict load
+gives898:887+11. A separate implementation and independent review reproduce
+the flow910 result after removing WAR/WAW and other conservative edges,
+retaining only direct true scratch-RAW edges already in the strict DAG.
+That relaxed graph deliberately omits memory dependencies and is not an
+executable schedule; its unchanged flow bound is a stronger certificate
+that this obstruction is not merely a conservative overwrite barrier.
+
+The previous924 graph instead has strict flow878 and load902 bounds. The
+new923 graph improves measured runtime but spends enough flow to introduce
+a higher fixed-graph bound. The arithmetic-only900 floor (startup-conditioned
+901) therefore does NOT establish a feasible900 budget for this graph.
+No910 schedule or globally optimal algorithm is claimed. Holding the
+15-operation minimum tail fixed, reaching900 would require at most886 flow
+operations, at least ten fewer. Any replacement must also fit load, compute
+and readiness budgets. The failed anchor-only927 control illustrates why
+removing this necessary obstruction alone does not predict runtime.
+
+`analyze_kernel.py` now reports resource-plus-tail bounds. The independent
+`iteration41_resource_tails.py` cross-checks the public analyzer and can
+emit full witness paths with `--details`. This changes analysis only.
+
+### Bounded alternatives and algorithmic research
+
+Whole-frontier scheduling dynamically identifies all eight gathers feeding
+the laggard's input XOR, rather than promoting one arbitrary final lane.
+The complete-entry variant moves the packet825..828→816..819 and its first
+MAC832→823, but total time worsens924→925 with all236 policies. A four-cycle
+consumer deadline only ties924. This is a genuine local latency reduction
+that loses globally; downstream waiting and displaced work matter.
+
+Lane-by-lane input XORs on raw gathers tie924 with scratch1464; combining
+early value decode and lane fusion ties924/1448. Reserving a VALU slot for
+a binary feeding an FMA ties924 on the original graph and923/1480 with the
+new addresses. Both full-policy comparisons lose to the simpler defaults.
+Root-copy elimination saves0.125–0.25 equivalents but no elapsed cycle.
+Second gathers to avoid right-child copies would add256 loads per level,
+already making the load budget impossible; those forms were rejected on
+cost before implementation. See the issue/transfer/frontier result files
+for every measured count, policy scope and strict correctness coverage.
+
+Eight new three-instruction hash families were excluded: parallel affine
+arms joined by XOR/AND/OR/MUL, or affine→binary-with-input→affine for those
+four binary operators, all with arbitrary constants and free stage1 XOR
+encoding. Necessary low16-bit constraints are UNSAT for every family;
+this is not a global hash-optimality proof.
+
+There is a valid latency-only identity. From middle hash value z, encoded
+parity is `((0x80048000*z+0xa3628000) mod 2^32) >> 31`. Algebra and a full32-bit
+counterexample query prove it. It shortens the parity dependency path from
+four operations to two, but the full hash is still required: net +1 weighted
+equivalent per selected group/round, plus three loads/broadcasts for setup.
+WAR-safe separate temporaries and late setup priority make bounded tail
+variants tie924. The final full236-policy combination with independent
+input addresses ties923/1440, work6746.625. It is not promoted.
+
+Next: use923 as the measured control, but change resource allocation or
+computation structure to remove the910 obstruction before further priority
+sweeps. Preserve pinned924 as a useful lower-flow alternative. Recompute
+resource-plus-tail bounds on proposed graphs; do not assume independent
+local gains, shorter path-bit latency, or smaller work totals compose.

@@ -1,6 +1,65 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
-Latest accepted implementation, iteration40 (2026-09-19): **924 cycles**, scratch
+Latest accepted implementation, iteration41 (2026-09-19): **923 cycles**,
+scratch **1,416/1,536**. First committed and pushed the verified924 baseline
+as `109610180033baa744a0fe80a2501e1ba2f73b00` to the user's fork, branch
+`optimize/kernel-v2`. This checkpoint bundles the verified923 implementation
+and iteration41 research records. Official9/9, built-in3/3,32 frozen seeds,eight full-word
+fixtures, emission/provenance, workspace/allocator checks and all extra
+shapes/path depths pass. No official tests or simulator changed.
+
+Materialize all32 input addresses independently with original-ISA
+`flow.add_imm` from readonly zero, replacing eight constant-load anchors
+and24 scalar increments. Input values are still read at runtime; only
+layout-derived addresses are immediate. Net: eight fewer loads, three fewer
+compute equivalents,32 more flow instructions. Transferring only the old
+increments to flow ties924; transferring only eight anchors takes927.
+The independent addresses, not merely the engine change, produce923.
+
+Current slots: load1775, VALU5414, ALU10629, flow896, store64. Work6742.625;
+first VALU1/ALU2; first/last flow0/896 with one hole; lookup51/912 with
+ten-cycle drain. The first flow operations construct addresses, not tree
+selects. `--compact-input-immediate 0` exactly restores924;1 enables923.
+Generic and exchange-disabled paths retain their old behavior.
+
+**Important new constraint: the fixed923 computation graph cannot reach900
+by scheduler tuning alone. Its resource-plus-tail flow lower bound is910.**
+All896 flow operations reach an output store, with a minimum remaining
+dependency path of15 unit-time operations INCLUDING the flow operation.
+At one flow slot per cycle, the last cannot issue before895, so completion
+cannot precede895+15=910. Removing WAR/WAW and other conservative edges
+leaves this bound unchanged on a scratch-RAW-only relaxation. This is a
+fixed-graph bound, not global algorithm optimality or an attainable910 claim.
+The strict load-plus-tail bound is898. Weighted arithmetic alone still says
+900 (startup-conditioned901), but misses this flow/tail obstruction.
+
+Next, in order:
+
+1. Change the resource allocation or graph before more priority sweeps. If
+   the15-operation minimum flow tail remains, flow count must fall from896
+   to at most886 for900 even to be possible. Include the replacement's load,
+   compute and new dependency costs; the anchor-only927 control warns that
+   a lower bound is not an elapsed-performance predictor. Recompute both
+   resource-plus-tail bounds for every promising structural candidate.
+2. Seek actual arithmetic/lookup work removal, preserving the new923 control
+   and the pushed924 control. Eight additional three-operation hash families
+   are now excluded by necessary low-bit UNSAT proofs. Other topologies and
+   representations remain open; no global hash-optimality claim is made.
+3. Consider the proven two-operation early-parity identity only on a changed
+   graph with a measured path-bit bottleneck. It adds one compute equivalent
+   per selected group/round plus setup. On this graph it only ties923 while
+   using more scratch; it is not an accepted hash rewrite.
+
+Whole-consumer-frontier priority did move an eight-load packet nine cycles
+earlier, but total time worsened924→925. Lane-input-XOR fusion and FMA
+fairness also failed to beat their controls. These results specifically
+reject equating local readiness gains with elapsed savings.
+See iteration41 in the log, the pinned probes and resource-tail certificate.
+There are23 elapsed cycles to900, and at least a structural change is needed.
+
+The following iteration40 status and its budget are historical.
+
+Accepted implementation, iteration40 (2026-09-19): **924 cycles**, scratch
 **1,424/1,536**, unchanged work6745.625. This checkpoint bundles the verified
 three-cycle improvement and research records over the pushed927 parent
 `ee87c658e6247232801432d7ab5a548d324c096d` on `optimize/kernel-v2` in the user's
@@ -13,8 +72,8 @@ The accepted change is an eligibility-aware stable sort: ready fused
 fragmented policies. Scalar ALUs cannot issue FMA, but can perform the binary
 operations. Thirteen additional vector operations move to scalar issue,
 without removing work or changing the dependency graph. Physical counts:
-load1783, VALU5417, ALU10629, flow864, store64. `--compact-fma-priority 0`
-exactly restores927;1 gives924. The rule is gated by compact flow exchange,
+load1783, VALU5417, ALU10629, flow864, store64. With input immediates disabled,
+`--compact-fma-priority 0` exactly restores927;1 gives924. The rule is gated by compact flow exchange,
 so generic and exchange-disabled paths retain their previous behavior.
 
 First/last flow14/898 has21 holes, versus24 on927. The last gather advances
@@ -69,7 +128,7 @@ last gather916 rather than917, and completion926 rather than927. There are
 24 flow holes instead of20: most of the earlier start is absorbed by later
 waiting, so the elapsed win is one cycle, not five. Starting one group can
 move first flow to13 but still takes930. Thus19 was never a hardware minimum.
-With FMA priority disabled, `--compact-startup-groups 0` restores928;2
+With FMA priority and input immediates disabled, `--compact-startup-groups 0` restores928;2
 enables927. Generic paths and the exchange-disabled control retain their
 prior scheduling behavior.
 Physical slots are load1783, VALU5430, ALU10525, flow864, store64. The ideal

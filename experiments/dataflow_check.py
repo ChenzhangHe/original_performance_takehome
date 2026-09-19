@@ -22,6 +22,8 @@ def accesses(engine, slot, lanes=None):
         return result
     if engine == 'flow' and op == 'vselect':
         return words('w', 1, vector)+sum((words('r', pos, vector) for pos in (2, 3, 4)), [])
+    if engine == 'flow' and op == 'add_imm':
+        return words('w', 1)+words('r', 2)
     if engine == 'load':
         if op == 'const':
             return words('w', 1)

@@ -32,6 +32,9 @@ def build(module):
 
 
 def run():
+    # Keep this historical on/off comparison on the pre-iteration41 graph.
+    original_input_immediate = production.COMPACT_INPUT_IMMEDIATE
+    production.COMPACT_INPUT_IMMEDIATE = False
     results = []
     for enabled in (True, False):
         args = Namespace(full_policies=True, age=0, choose='priority', valu_fma=enabled,
@@ -66,6 +69,7 @@ def run():
                             offloads=len(integrated.offloaded_ops),
                             partial_max=max(max(x)-min(x) for x in integrated.lane_issue_cycles.values())))
     production.COMPACT_FMA_PRIORITY = True
+    production.COMPACT_INPUT_IMMEDIATE = original_input_immediate
     print(json.dumps(dict(source_ref=SOURCE_REF, results=results), indent=2))
 
 

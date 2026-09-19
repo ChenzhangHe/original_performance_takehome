@@ -18,6 +18,42 @@ class AnalyzedKernel(KernelBuilder):
         super().allocate_node_lifetimes(ops, uses, reusable)
 
 
+def resource_tail_bounds(builder):
+    """Necessary bounds for this fixed graph, including work after issue.
+
+    Only load/flow have fixed engine assignments here. Logical VALU work
+    may instead use scalar offload, so its partition is not a valid bound.
+    Unit-latency tails optimistically ignore multi-cycle offload duration.
+    """
+    ops = builder.operations
+    successors = [[] for _ in ops]
+    pending = [len(op["deps"]) for op in ops]
+    order = [i for i, count in enumerate(pending) if count == 0]
+    for i, op in enumerate(ops):
+        for dep in op["deps"]:
+            successors[dep].append(i)
+    for i in order:
+        for child in successors[i]:
+            pending[child] -= 1
+            if pending[child] == 0:
+                order.append(child)
+    assert len(order) == len(ops)
+    tails = [int(op["engine"] == "store" and not op.get("is_setup", False)) for op in ops]
+    for i in reversed(order):
+        children = [tails[s] for s in successors[i] if tails[s]]
+        if children:
+            tails[i] = max(tails[i], 1 + max(children))
+    bounds = {}
+    for engine in ("load", "flow"):
+        ordered = sorted((tails[i] for i, op in enumerate(ops) if op["engine"] == engine and tails[i]), reverse=True)
+        capacity = SLOT_LIMITS[engine]
+        bound, count, tail = max((ceil(k / capacity) - 1 + t, k, t)
+                                 for k, t in enumerate(ordered, 1))
+        bounds[engine] = dict(bound=bound, output_reaching_operations=len(ordered),
+                              minimum_tail=min(ordered), witness_count=count, witness_tail=tail)
+    return bounds
+
+
 def analyze(builder):
     operations = builder.operations
     issued = builder.issue_cycles
@@ -91,9 +127,11 @@ def analyze(builder):
         "compact_deep_select_delay": getattr(builder, "compact_deep_select_delay", 0),
         "compact_startup_groups": getattr(builder, "compact_startup_groups", 0),
         "compact_fma_priority": getattr(builder, "compact_fma_priority", False),
+        "compact_input_immediate": getattr(builder, "compact_input_immediate", False),
         "blocked_reverse_input_chain_length": builder.blocked_reverse_input_chain_length,
         "direct_gather_addresses": builder.direct_gather_addresses,
         "engines": engines,
+        "resource_tail_bounds": resource_tail_bounds(builder),
         "compute": {
             "weighted_equivalents": counts["valu"] + counts["alu"] / 8,
             "optimistic_combined_floor": ceil((counts["valu"] + counts["alu"] / 8) / 7.5),
