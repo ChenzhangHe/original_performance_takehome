@@ -25,6 +25,7 @@ def analyze(builder):
     assert len(issued) == len(operations)
     by_round = defaultdict(lambda: defaultdict(list))
     waits = defaultdict(list)
+    engine_times = defaultdict(list)
     counts = Counter()
     gathers = []
     lookup_loads = []
@@ -34,10 +35,11 @@ def analyze(builder):
         engine = "alu" if i in builder.offloaded_ops else op["engine"]
         lane_times = builder.lane_issue_cycles.get(i, [issued[i]])
         counts[engine] += len(lane_times)
+        engine_times[engine].extend(lane_times)
         waits[engine].extend(t - ready for t in lane_times)
         # Scheduling deadlines are not execution semantics. In particular,
         # deferred setup vloads must not look like body node lookups.
-        semantic_round = -1 if op.get("is_setup", False) else op["round"]
+        semantic_round = -1 if op.get("is_setup", False) else op.get("semantic_round", op["round"])
         by_round[semantic_round][engine].extend(lane_times)
         if engine == "load" and op["slot"][0] == "load_offset":
             gathers.append(issued[i])
@@ -50,6 +52,10 @@ def analyze(builder):
         engines[engine] = {
             "slots": count,
             "static_floor": ceil(count / capacity),
+            "first_issue": min(engine_times[engine]),
+            "last_issue": max(engine_times[engine]),
+            # Conditional on this schedule's startup, not a global bound.
+            "conditional_finish_bound": min(engine_times[engine]) + ceil(count / capacity),
             "full_issue_cycles": sum(
                 len(bundle.get(engine, ())) == capacity for bundle in builder.instrs
             ),
@@ -65,6 +71,7 @@ def analyze(builder):
         "max_fragment_span": max((max(ts) - min(ts) + 1 for ts in builder.lane_issue_cycles.values()), default=0),
         "pruned_constant_loads": builder.pruned_constant_loads,
         "preencoded_nodes": sum(index is not None for index in builder.workspace_node_indices),
+        "unique_preencoded_nodes": len({index for index in builder.workspace_node_indices if index is not None}),
         "workspace_words": builder.preencoded_node_count,
         "workspace_layout": builder.workspace_layout,
         "blocked_lookup": builder.blocked_lookup,
@@ -77,9 +84,21 @@ def analyze(builder):
         "compact_lane_tail": builder.compact_lane_tail,
         "compact_parent_index_select": builder.compact_parent_index_select,
         "compact_deep_landing": builder.compact_deep_landing,
+        "compact_shallow_landing": getattr(builder, "compact_shallow_landing", False),
+        "compact_flow_exchange": getattr(builder, "compact_flow_exchange", False),
+        "compact_depth3_gather_chunks": getattr(builder, "compact_depth3_gather_chunks", 0),
+        "compact_setup_deadline_cap": getattr(builder, "compact_setup_deadline_cap", 4),
+        "compact_deep_select_delay": getattr(builder, "compact_deep_select_delay", 0),
         "blocked_reverse_input_chain_length": builder.blocked_reverse_input_chain_length,
         "direct_gather_addresses": builder.direct_gather_addresses,
         "engines": engines,
+        "compute": {
+            "weighted_equivalents": counts["valu"] + counts["alu"] / 8,
+            "optimistic_combined_floor": ceil((counts["valu"] + counts["alu"] / 8) / 7.5),
+            "conditional_combined_finish_bound": ceil((counts["valu"] + counts["alu"] / 8
+                + 6 * min(engine_times["valu"]) + 1.5 * min(engine_times["alu"])) / 7.5),
+            "necessary_900_deficit": max(0, counts["valu"] + counts["alu"] / 8 - 6750),
+        },
         "gather": {
             "first": min(gathers), "last": max(gathers), "slots": len(gathers),
             "drain_cycles": len(builder.instrs) - max(gathers) - 1,

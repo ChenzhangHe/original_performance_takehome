@@ -1,5 +1,60 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
+Latest accepted implementation: iteration38, **928 cycles**, scratch **1,440/1,536**,
+parent `34742f6` (941). This is a **13-cycle** improvement. Official9/9,
+built-in3/3,32 frozen seeds,eight full-word fixtures,emission/provenance,
+allocator boundaries and six extra shapes/three alternate path depths pass.
+
+The important change is a measured resource exchange, not another hash
+rewrite. Shallow direct child landing removes30 net compute equivalents.
+Use eight of the shallow record padding words for encoded depth3 nodes;
+the other eight retain the final pair from preprocessing. For the highest
+16 groups in the FIRST traversal, replace seven cached selects with eight
+scalar gathers and one complete address-bias select. That releases96 flow
+slots without adding body compute. Spend64 flow slots on depth8/9 bias
+selection, eliminating64 more compute equivalents; new setup costs6.
+
+Net versus941: **-88 compute equivalents, +135 loads, -32 flow**. Final
+slots: load1,783, VALU5,432, ALU10,509, flow864, store64. Weighted compute
+is **6,745.625**, versus the ideal900-cycle total capacity of6,750. Its
+optimistic aggregate floor is now **900**, with no aggregate compute/load
+deficit. This does NOT show that900 is schedulable: the margin is only4.375
+equivalents, and even startup-conditioned ideal compute finishes at902.
+
+Important correction to the older budget: flow count896 did not mean
+900 had four usable spare slots. The941 kernel's first flow is at19, so
+its conditional finish bound is915. In928, first/last flow is19/902,
+count864, conditional finish883;20 idle flow cycles remain. Combined
+lookup traffic is1,664 slots, first/last53/917, conditional finish885,
+then10 cycles of drain. All are conditional on the measured start times,
+not proofs of a globally optimal bound.
+
+The final928 comes from the full existing policy set: delay the priority
+of depth8/9 bias SELECTS by one logical round, without delaying their MACs
+or changing dependencies. This wins two cycles over the930 full-policy
+control. Three-policy screening missed it (932): validate structural
+winners with the complete policy set. Setup deadline cap6 reduces storage.
+
+Next, in order:
+
+1. Reduce startup/tail losses on this cheaper graph. Inspect flow's20 holes,
+   load readiness and the last10 cycles; preserve the16-group exchange as
+   control. Moving all address operations together did not help.
+2. Seek additional REAL work removal to create startup margin. The current
+   aggregate900 budget is essentially full. More depth3 gathers do not
+   lower compute;18 groups already use1,799 loads, leaving only one of the
+   nominal1,800 slots. More gathers are not free progress.
+3. Rebalance vector versus scalar issue only with complete lane/provenance
+   checks. The current physical VALU count alone has floor906; ideal total
+   capacity assumes further useful offload and no startup waste.
+
+Workspace contains256 encoded fields representing248 distinct nodes;
+there are no zero padding words. Header/forest remain untouched. The hash
+is unchanged. No leaderboard query, benchmark submission, commit or push.
+See iteration38 in the log for formulas, A/B and reproduction commands.
+
+The implementation status below is historical.
+
 Latest accepted implementation: iteration 37, **941 cycles**, scratch
 **1,480 / 1,536**, parent `2d5bc94` (954). The 13-cycle improvement removes
 real lookup/copy work; the ten-operation hash is unchanged.

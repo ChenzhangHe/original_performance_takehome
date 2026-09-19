@@ -81,6 +81,31 @@ def verify_analysis(builder, report):
     assert report["lookup_load"]["slots"] == lookup_slots
     if builder.blocked_setup_deadlines:
         assert any(op.get("is_setup", False) and op["round"] > 0 for op in builder.operations)
+    for op in builder.operations:
+        if "semantic_round" in op:
+            assert op["engine"] == "flow" and op["slot"][0] == "vselect"
+            assert op["semantic_round"] in (8, 9)
+            assert op["round"] == op["semantic_round"] + builder.compact_deep_select_delay
+
+
+def verify_workspace_addresses(builder):
+    """Exhaust all depth3 paths and both next-child choices in the new layout."""
+    if not getattr(builder, "compact_flow_exchange", False):
+        return
+    workspace_base = 7 + 2047
+    for p0 in (0, 1):
+        for p1 in (0, 1):
+            for p2 in (0, 1):
+                original = 21 - 4*p0 - 2*p1 - p2
+                encoded = workspace_base + (15 if p0 else 31) - 8*p1 - 4*p2
+                assert encoded == 4*original + workspace_base - 53
+                assert builder.workspace_node_indices[encoded-workspace_base] == original-7
+                for p3 in (0, 1):
+                    child = 2*original - 5 - p3
+                    record = 2*encoded - workspace_base - (6 if p3 else 2)
+                    assert record == 4*child + workspace_base - 88
+                    field = 1 if builder.compact_shallow_landing else 0
+                    assert builder.workspace_node_indices[record-workspace_base+field] == child-7
 
 
 def verify_allocator_boundaries():
@@ -145,6 +170,7 @@ def main():
     builder.build_kernel(10, 2047, 256, 16)
     verify_emission(builder)
     verify_dataflow(builder)
+    verify_workspace_addresses(builder)
     for seed in range(1000, 1032):
         check(builder, seed)
     patterns = (("zero", 0), ("ones", 0xFFFFFFFF),
@@ -163,7 +189,7 @@ def main():
     report.pop("rounds")
     if args.extra_shapes:
         report["extra_shape_checks"] = verify_extra_shapes()
-    print(json.dumps(dict(schedule_emission="pass", scratch_dataflow="pass", allocator_boundaries="pass", setup_accounting="pass", random_seeds=32,
+    print(json.dumps(dict(schedule_emission="pass", scratch_dataflow="pass", allocator_boundaries="pass", workspace_addresses="pass", setup_accounting="pass", random_seeds=32,
                           full_word_fixtures=8, **report), indent=2))
 
 

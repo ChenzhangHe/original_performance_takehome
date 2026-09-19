@@ -73,6 +73,11 @@ BLOCKED_COMPACT_DEEP = True
 COMPACT_LANE_TAIL = True
 COMPACT_PARENT_INDEX_SELECT = True
 COMPACT_DEEP_LANDING = True
+COMPACT_SHALLOW_LANDING = True
+COMPACT_SETUP_DEADLINE_CAP = 6
+COMPACT_FLOW_EXCHANGE = True
+COMPACT_DEPTH3_GATHER_CHUNKS = 16
+COMPACT_DEEP_SELECT_DELAY = 1
 
 
 class KernelBuilder:
@@ -541,6 +546,13 @@ class KernelBuilder:
         self.compact_lane_tail = compact_deep and COMPACT_LANE_TAIL
         self.compact_parent_index_select = compact_deep and COMPACT_PARENT_INDEX_SELECT
         self.compact_deep_landing = compact_deep and COMPACT_DEEP_LANDING and BLOCKED_FUSE_PARENT_XOR
+        self.compact_shallow_landing = compact_deep and COMPACT_SHALLOW_LANDING and BLOCKED_FUSE_PARENT_XOR
+        self.compact_flow_exchange = compact_deep and COMPACT_FLOW_EXCHANGE
+        self.compact_setup_deadline_cap = COMPACT_SETUP_DEADLINE_CAP if compact_deep else 4
+        self.compact_depth3_gather_chunks = COMPACT_DEPTH3_GATHER_CHUNKS if self.compact_flow_exchange else 0
+        self.compact_deep_select_delay = COMPACT_DEEP_SELECT_DELAY if self.compact_flow_exchange else 0
+        assert 0 <= COMPACT_DEPTH3_GATHER_CHUNKS <= chunk_count or not compact_deep
+        assert self.compact_setup_deadline_cap >= 0 and COMPACT_DEEP_SELECT_DELAY >= 0
         assert BLOCKED_REVERSE_INPUT_CHAIN_LENGTH >= 0
         self.blocked_reverse_input_chain_length = BLOCKED_REVERSE_INPUT_CHAIN_LENGTH if blocked_lookup else 0
         assert BLOCKED_READ_BANKS in (1, 2, 4, 8)
@@ -800,12 +812,26 @@ class KernelBuilder:
             if preencode:
                 direct_vectors.extend((thirty_two, copied_bias, five_vector, exiting_bias))
 
+        if self.compact_flow_exchange:
+            # The first eight shallow-record padding words hold encoded D3
+            # nodes: D3=4*A3+W-53. Selecting the complete p3 bias gives
+            # B4=2*D3-W-2-4*p3, without a second address arithmetic step.
+            exchange_left = vector_const(forest_values_p+n_nodes+15, "exchange_left")
+            exchange_right = vector_const(forest_values_p+n_nodes+31, "exchange_right")
+            exchange_exit = vector_const((-forest_values_p-n_nodes-2)&0xffffffff, "exchange_exit")
+            exchange_exit_even = vector_const((-forest_values_p-n_nodes-6)&0xffffffff, "exchange_exit_even")
+            direct_vectors.append(exchange_exit_even)
+            exchange_neg4 = negative_weights[2]
+            exchange_even = vector_const(0xfffffffa, "exchange_even")
+            address_bases[3] = (exchange_left, exchange_right)
+            direct_vectors.extend((exchange_left, exchange_right, exchange_exit, exchange_even))
         extra_encode_buffers = []
         if blocked_lookup:
             # Transpose the runtime depth-4/5 values into 16 four-word records:
-            # [encoded parent, encoded left child, encoded right child, zero].
-            # A vload may read the next record too, but only its first 3 words
-            # are consumed. Even the last read stays inside the index array.
+            # Parent/children records optionally put the left child first so
+            # overlapping vloads can land it directly into its final vector.
+            # Padding doubles as the flow-exchange D3 table. A vload may read
+            # the next record too, but only its first three words are consumed.
             block_base = forest_values_p + n_nodes
             block_input = [self.alloc_scratch(f"block_input_{i}", VLEN) for i in range(3)]
             block_output = self.alloc_scratch("block_output", VLEN)
@@ -823,13 +849,20 @@ class KernelBuilder:
                         parent = pair*2 + member
                         children = [block_input[1 + (2*parent+j)//VLEN] + (2*parent+j)%VLEN
                                     for j in (0, 1)]
-                        for j, scalar in enumerate([block_input[0]+parent, *children]):
+                        fields = ([children[0], block_input[0]+parent, children[1]]
+                                  if self.compact_shallow_landing else [block_input[0]+parent, *children])
+                        for j, scalar in enumerate(fields):
                             # Each source field is transposed exactly once.
                             # Encode during that existing scalar copy instead
                             # of first XORing all six input vectors separately.
                             opcode, operand = (("^", final_xor_const) if BLOCKED_FUSE_SETUP_XOR
                                                else ("+", readonly_zero))
                             self.add("alu", (opcode, block_output + 4*member+j, scalar, operand))
+                        if self.compact_flow_exchange and parent_start == 0:
+                            # Later stores retain the final two encoded words;
+                            # only padding in the first eight records is read.
+                            self.add("alu", ("+", block_output + 4*member+3,
+                                             depth3_vectors[parent ^ 1], readonly_zero))
                     self.add("store", ("vstore", block_store_addr, block_output))
                     if parent_start != 8 or pair != 3:
                         self.add("alu", ("+", block_store_addr, block_store_addr, address_step))
@@ -847,12 +880,24 @@ class KernelBuilder:
             for shift in ((1, 2) if BLOCKED_DROP_UNUSED_WEIGHT else (1, 2, 3)):
                 negative_weights[shift] = vector_const((-4*(1 << shift)) & 0xFFFFFFFF,
                                                        f"block_weight_{shift}")
+            if self.compact_flow_exchange:
+                exchange_neg8 = negative_weights[1]
             address_bases[4] = (vector_const(block_base+28, "block_left"),
                                 vector_const(block_base+60, "block_right"))
             direct_vectors.extend((block_exit_bias, *negative_weights.values(), *address_bases[4]))
+            if self.compact_shallow_landing:
+                # The last round gathers only the parent, now at field one.
+                block_tail_bases = (vector_const(block_base+29, "shallow_tail_left"),
+                                    vector_const(block_base+61, "shallow_tail_right"))
+                direct_vectors.extend(block_tail_bases)
             self.preencoded_node_count = 64
-            self.workspace_node_indices = [index for parent in range(15, 31)
-                                           for index in (parent, 2*parent+1, 2*parent+2, None)]
+            self.workspace_node_indices = []
+            for parent in range(15, 31):
+                padding = ((7+(parent-15)%8 if parent < 23 else 13+(parent-15)%2)
+                           if self.compact_flow_exchange else None)
+                fields = ((2*parent+1, parent, 2*parent+2, padding)
+                          if self.compact_shallow_landing else (parent, 2*parent+1, 2*parent+2, padding))
+                self.workspace_node_indices.extend(fields)
             self.workspace_layout = "parent_children_stride4"
             if compact_deep:
                 self.preencoded_node_count += 192
@@ -925,6 +970,11 @@ class KernelBuilder:
                     if vector_no != 64 // VLEN - 1:
                         self.add("alu", ("+", extra_src, extra_src, address_step))
                         self.add("alu", ("+", extra_dst, extra_dst, address_step))
+
+        if self.compact_shallow_landing:
+            self.workspace_layout += "_shallow_left_first"
+        if self.compact_flow_exchange:
+            self.workspace_layout += "_padding_depth3"
 
         # Fold initialization into the same DAG as the kernel.  Main operations
         # gain dependencies on the setup instructions that produce their inputs.
@@ -1089,10 +1139,14 @@ class KernelBuilder:
                 emit_context["round"] = round_no
                 round_starts.append(len(ops))
                 depth = round_no % (forest_height + 1)
+                # Exchange only the first traversal's highest groups. Their
+                # extra D3 gathers free selects for all deep address updates.
+                exchange = (self.compact_flow_exchange and round_no <= 3
+                            and chunk_no >= chunk_count-self.compact_depth3_gather_chunks)
                 if depth == 0:
                     path_bits = {}
                     if positive_addresses:
-                        first_gather_depth = 5 if depth4_cached(round_no + 4, chunk_no) else 4
+                        first_gather_depth = 3 if exchange else (5 if depth4_cached(round_no + 4, chunk_no) else 4)
                         if first_gather_depth > min(forest_height, rounds - 1 - round_no):
                             first_gather_depth = None
                     reuse_depth = min(PATH_REUSE_DEPTH, forest_height, rounds - 1 - round_no)
@@ -1111,6 +1165,8 @@ class KernelBuilder:
                 cached_lookup = (0 < depth <= LOOKUP_DEPTH) or (
                     depth == 4 and depth4_cached(round_no, chunk_no)
                 )
+                if exchange and depth == 3:
+                    cached_lookup = False
                 direct_lookup = cached_lookup and 2 <= depth <= DIRECT_PATH_DEPTH
                 interpolation, interpolation_ready = (
                     path_bits[depth - 1] if direct_lookup else (chunk_idx, idx_ready)
@@ -1147,6 +1203,10 @@ class KernelBuilder:
                         # S2 base (p0 ? -6 : -8), while this round hashes.
                         left_base, right_base = (address_bases[first_gather_depth] if positive_addresses
                                                  else (depth2_left_base, depth2_right_base))
+                        if self.compact_shallow_landing and round_no > forest_height:
+                            left_base, right_base = block_tail_bases
+                        if exchange:
+                            left_base, right_base = exchange_left, exchange_right
                         idx_ready = select(chunk_idx, root_parity, left_base, right_base, selected)
                 elif blocked_lookup and depth == 2:
                     # Consume the older path bit first. Only the last select
@@ -1202,6 +1262,11 @@ class KernelBuilder:
                         val_ready,
                         selected,
                     )
+                elif exchange and depth == 3:
+                    node_loads = [emit("load", ("load_offset", chunk_node, chunk_idx, lane),
+                                       idx_ready, block_stores) for lane in range(VLEN)]
+                    node_address_reads = node_loads
+                    val_ready = emit("valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, node_loads)
                 elif blocked_lookup and depth == 3:
                     low, middle, high = path_bits[2], path_bits[1], path_bits[0]
                     quartet = []
@@ -1433,12 +1498,17 @@ class KernelBuilder:
                     val_ready = emit(
                         "valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected
                     )
-                elif self.compact_deep_landing and depth == 6:
+                elif ((self.compact_shallow_landing and depth == 4 and round_no != rounds - 1)
+                      or (self.compact_deep_landing and depth == 6)):
                     # Overlapping reads preserve earlier left-child lanes.
                     # Only the parent/right fields are consumed before the
                     # next load overwrites them. Keep strict WAR dependencies.
                     block_use_start = len(ops)
-                    record_base = block_children_base + 2*batch_size + chunk_count*BLOCKED_READ_BANKS*VLEN
+                    record_base = block_children_base
+                    record_stores = block_stores
+                    if depth == 6:
+                        record_base += 2*batch_size + chunk_count*BLOCKED_READ_BANKS*VLEN
+                        record_stores = extra_level_stores
                     block_left = record_base + 3*offset
                     block_right = block_left + 2*VLEN
                     pending = None
@@ -1449,7 +1519,7 @@ class KernelBuilder:
                         read_buffer = block_left+lane
                         loaded = emit("load", ("vload", read_buffer, chunk_idx+lane),
                                       idx_ready[lane] if isinstance(idx_ready, list) else idx_ready,
-                                      extra_level_stores, pending)
+                                      record_stores, pending)
                         node_address_reads.append(loaded)
                         parent = emit("alu", ("^", chunk_val+lane, chunk_val+lane, read_buffer+1), loaded, val_ready)
                         child = emit("alu", ("+", block_right+lane, read_buffer+2, readonly_zero), loaded)
@@ -1501,7 +1571,8 @@ class KernelBuilder:
                     selected = select(chunk_node, block_parity, block_left, block_right,
                                       block_parity_ready, block_children_ready)
                     val_ready = emit("valu", ("^", chunk_val, chunk_val, chunk_node), val_ready, selected)
-                    if self.compact_deep_landing and depth == 7:
+                    if ((self.compact_shallow_landing and depth == 5)
+                            or (self.compact_deep_landing and depth == 7)):
                         # Negative width denotes one indivisible contiguous
                         # span, not two independently colored vectors.
                         node_pool_uses.append((block_left, block_use_start, len(ops), -2))
@@ -1553,7 +1624,9 @@ class KernelBuilder:
                     )
                 if cached_lookup:
                     node_pool_uses.append((chunk_node, lookup_start, len(ops), NODE_VIRTUAL_VECTORS))
-                if blocked_lookup and depth == 4 and round_no != rounds - 1:
+                if exchange and depth == 3:
+                    pass  # Choose the complete address bias after p3 arrives.
+                elif blocked_lookup and depth == 4 and round_no != rounds - 1:
                     if not self.compact_parent_index_select:
                         slot = (("multiply_add", chunk_idx, chunk_idx, deep_three, block_exit_bias) if compact_deep
                                 else ("+", chunk_idx, chunk_idx, block_exit_bias))
@@ -1561,6 +1634,7 @@ class KernelBuilder:
                 elif (positive_addresses and first_gather_depth is not None
                         and not (blocked_lookup and (depth == 5 or (compact_deep and depth == 7)
                                                       or (self.compact_parent_index_select and depth == 6)))
+                        and not (self.compact_flow_exchange and depth in (8, 9))
                         and depth >= first_gather_depth and round_no < rounds - 1
                         and depth < forest_height):
                     # A' = 2*A - 5 - p. Prepare the affine base while hashing,
@@ -1699,6 +1773,26 @@ class KernelBuilder:
                     idx_ready = None
                     continue
                 if positive_addresses:
+                    if exchange and depth == 3:
+                        chosen_bias = select(chunk_tmp1, parity_dest, exchange_exit_even, exchange_exit, parity)
+                        idx_ready = emit("valu", ("multiply_add", chunk_idx, chunk_idx, two, chunk_tmp1),
+                                         idx_ready, chosen_bias, node_address_reads)
+                        continue
+                    if exchange and depth in (1, 2):
+                        idx_ready = emit("valu", ("multiply_add", chunk_idx, parity_dest,
+                                         exchange_neg8 if depth == 1 else exchange_neg4, chunk_idx), parity, idx_ready)
+                        continue
+                    if self.compact_flow_exchange and depth in (8, 9):
+                        # The select and following MAC replace early MAC plus
+                        # eight parity subtracts. Bias selection is lower
+                        # scheduling priority; all true dependencies remain.
+                        emit_context["round"] = round_no+self.compact_deep_select_delay
+                        chosen_bias = select(chunk_tmp1, parity_dest, exchange_even, address_bias, parity)
+                        ops[chosen_bias]["semantic_round"] = round_no
+                        emit_context["round"] = round_no
+                        idx_ready = emit("valu", ("multiply_add", chunk_idx, chunk_idx, two, chunk_tmp1),
+                                         idx_ready, chosen_bias, node_address_reads)
+                        continue
                     if self.compact_parent_index_select and depth in (4, 6):
                         # The next round already has its child value. Spend a
                         # flow select here, hiding address work behind that hash
@@ -1805,8 +1899,8 @@ class KernelBuilder:
 
         This only changes scheduling metadata. Memory-copy dependencies stay
         intact. An explicit prefix boundary separates setup from body ops;
-        is_setup remains immutable for analysis. Capping the priority at
-        round 4 avoids retaining setup inputs until the final cached round.
+        is_setup remains immutable for analysis. The compact records can wait
+        until round 6; the legacy path retains its earlier round-4 cap.
         """
         needed = [len(ops)] * len(ops)
         for i, op in enumerate(ops):
@@ -1820,7 +1914,7 @@ class KernelBuilder:
         for i, op in enumerate(ops):
             if i < setup_end:
                 assert op["is_setup"]
-                op["round"] = min(4, needed[i])
+                op["round"] = min(self.compact_setup_deadline_cap, needed[i])
 
     def prune_unused_constants(self, ops, uses):
         """Remove unread, dependency-free constants after the full DAG exists.

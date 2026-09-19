@@ -137,3 +137,38 @@ seeds and full-word workspace. Production additionally passes the complete
 32-seed/eight-fixture suite, official tests, extra shapes and allocator
 boundary regressions. See iteration37 of the log for budgets and every
 important negative result. Kernel code does not import experiment modules.
+
+## Iteration38: resource exchange, 928 cycles
+
+All iteration38 source transforms pin `34742f6` (941 cycles). They compose
+in memory; no production kernel imports these probes. Every reported valid
+candidate checks three frozen seeds, exact emission, scratch provenance,
+and a full32-bit workspace fixture. Production has the broader acceptance
+suite. Complete policy sets matter: the winning structure was missed by
+three-policy screening.
+
+```sh
+# 940, work6803.625: shallow left-child landing + setup cap6.
+python3 experiments/iteration38_shallow_landing.py --setup-cap 6 --full-policies
+# 940 on old layout, unchanged work: independent metadata-only control.
+python3 experiments/iteration38_readiness.py --early-shallow --setup-deadline-cap 6 --full-policies
+# Padding-only control: +1 compute equivalent, no lookup changes.
+python3 experiments/iteration38_compute.py --reuse-padding --full-policies
+# Resource exchange: 930 with all policies, work6745.625.
+python3 experiments/iteration38_exchange.py --groups 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 --parent-select --reuse-padding --full-policies
+# Accepted scheduling priority on that graph: 928.
+python3 experiments/iteration38_exchange_readiness.py --groups 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 --variants select_late --full-policies
+
+# Production controls and complete acceptance.
+python3 tune_kernel.py --compact-flow-exchange 0 --compact-shallow-landing 0 --compact-setup-deadline-cap 4 --seeds 123 456 789  # 941
+python3 tune_kernel.py --compact-flow-exchange 0 --seeds 123 456 789  # 940
+python3 tune_kernel.py --compact-deep-select-delay 0 1 --seeds 123 456 789  # 930/928
+python3 verify_kernel.py --extra-shapes
+```
+
+`--groups` in the exchange probes is an explicit list of vector group IDs,
+not data-dependent membership. Only their first traversal uses depth3
+gathers. Node values and addresses are computed by emitted runtime code;
+there is no answer precomputation. The group choice affects readiness:
+16 high groups are faster than16 middle groups despite identical counts.
+Do not equate the new aggregate compute floor900 with an achieved900 score.

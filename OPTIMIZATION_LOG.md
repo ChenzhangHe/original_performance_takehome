@@ -2677,3 +2677,138 @@ python3 tests/submission_tests.py
 python3 perf_takehome.py
 python3 verify_kernel.py --extra-shapes
 ```
+
+## Iteration38 — shallow landing and a load/flow/compute exchange (2026-09-18)
+
+Parent: `34742f6253c7cb1b1b2a3ca664b6b5f2d9a29991`, **941 cycles**.
+Result: **928 cycles**, scratch **1,440/1,536**. Official9/9, built-in3/3,
+32 frozen seeds, eight full-word fixtures, exact emission/provenance,
+allocator boundaries and six extra shapes/three alternate path depths pass.
+The emitted instructions, logical slots and dependencies match the winning
+prototype exactly. No commit or push is part of this optimization turn.
+No official tests, simulator, instruction limits, or input data have been
+changed; only the separate local verifier is extended.
+
+### Start with a body reduction, then spend the released resources
+
+Shallow records become `[left,parent,right,padding]`. Eight strictly ordered
+overlapping vloads land left-child lanes directly in a contiguous vector.
+Parent XOR/right-copy readers still complete before the next overwrite;
+the full16-word landing span stays atomic in lifetime allocation. Removing
+256 scalar copies saves32 equivalents; two tail-address broadcasts cost2,
+for net30. Final round15 gathers the parent at field1, requiring dedicated
+`W+29/W+61` bases rather than `W+28/W+60`. Setup first-use cap6 reduces the
+scratch lifetime peak. This alone gives940/1424, not a route to900.
+
+The new insight is to use a little load capacity to free enough flow capacity
+to eliminate arithmetic. Store encoded depth3 nodes7..14 in the first eight
+padding fields of the shallow table. Only eight extra scalar copies are
+needed (1 equivalent); after that the last pair13/14 stays in the reusable
+output buffer and fills the remaining padding positions. Their exact values
+are declared in `workspace_node_indices` and independently checked.
+
+For the highest16 vector groups, first traversal only, replace depth3's
+seven vselects with eight scalar gathers from that encoded padding table.
+Use these address identities (`p` is inverse/raw encoded hash parity):
+
+```
+D3 = 4*A3 + W - 53
+B4 = 2*D3 - W - 2 - 4*p3
+```
+
+Choose the COMPLETE B4 bias with one vselect, then one MAC. The gathered
+node is already encoded, so there is no new node-XOR encoding operation.
+Compared with the original cached path, each such group adds8 loads,
+removes6 flow slots, and leaves body compute unchanged. Root parity chooses
+D3 bases `W+15/W+31`; subsequent path bits use weights-8/-4, reusing existing
+constants. There is no divide or scratch-indirect lookup.
+
+Sixteen groups thus free96 flow slots. Spend64 on complete-bias selection
+at depths8/9 for all32 groups:
+
+```
+A_next = 2*A - 5 - p
+       = multiply_add(A, 2, select(p, -6, -5))
+```
+
+This deletes64 vector-equivalent arithmetic operations. The selected bias
+and MAC both retain all actual parity/address-read dependencies. Unlike
+depth4/6 prefetch parents, these depths have gather-dependent successors;
+the latency cost must be measured, not assumed hidden.
+
+Net setup cost on the landing graph is6 equivalents: five broadcasts plus
+one equivalent of padding copies. Net versus941 is **-30-64+6=-88**. This is
+the first measured graph whose aggregate weighted compute fits nominal900.
+Hash evaluation remains the same ten-operation implementation.
+
+### Bounded experiments and non-additive scheduling
+
+| Candidate | Policies | Cycles | Scratch | Weighted compute | Loads | Flow |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Committed parent | full | 941 | 1480 | 6833.625 | 1648 | 896 |
+| Shallow copy priority earlier + setup cap6; old layout | full | 940 | 1440 | 6833.625 | 1648 | 896 |
+| Shallow direct landing + cap6 | full | 940 | 1424 | 6803.625 | 1650 | 896 |
+| Nine middle groups, two-MAC D3 conversion, unpruned setup | 3 | 941 | 1416 | 6756.625 | 1726 | 897 |
+| Eleven middle groups, bias-select D3 conversion | 3 | 938 | 1408 | 6745.625 | 1743 | 894 |
+| Eleven highest groups, same work | 3 | 941 | 1488 | 6745.625 | 1743 | 894 |
+| Fourteen highest groups | 3 | 935 | 1480 | 6745.625 | 1767 | 876 |
+| Sixteen middle groups | 3 | 941 | 1416 | 6745.625 | 1783 | 864 |
+| Sixteen highest groups | 3 | 931 | 1472 | 6745.625 | 1783 | 864 |
+| Eighteen highest groups | 3 | 931 | 1464 | 6745.625 | 1799 | 852 |
+| Sixteen highest groups | full | 930 | 1456 | 6745.625 | 1783 | 864 |
+| Above + depth8/9 bias-select priority one round later | full | **928** | **1440** | **6745.625** | **1783** | **864** |
+
+Keep all existing policies. Three-policy screening gave932 for the eventual
+928 winner, so it would have wrongly discarded it. The winning policy is
+`fragment_adaptive_tail_hetero_360_240_240_220_900`. Only the SELECT priority
+is one round later; its address MAC retains the original round. No real
+dependence changes. Moving both later gives930; cap4 alone929, and cap4
+combined with the delayed select929. Earlier select/MAC priorities and
+removing depth8/9 lane-tail release give930. Do not add their apparent
+individual improvements arithmetically.
+
+Other shallow probes: two banks tie940 but add16 equivalents; four banks941;
+retaining parent-first order with two banks941; partial16-group landing
+940–942 with16 extra equivalents. Releasing parent hash from all child-copy
+barriers does not help. All valid scores retain the strengthened allocator,
+emission reconstruction and scratch-provenance checks.
+
+### Better budgets: count startup and movement, not just totals
+
+Final slots: load1,783, VALU5,432, ALU10,509, flow864, store64. Versus941:
+load+135, VALU-71, ALU-136, flow-32, store unchanged. Scratch-40. Weighted
+compute6,745.625 has an optimistic combined floor900, with4.375 equivalents
+to spare against nominal6,750. But conditioning on the observed first VALU
+at1 and first ALU at8 already gives a combined finish bound902. The chosen
+physical VALU allocation alone has floor906. Neither number is a globally
+optimal-schedule proof, and no900-cycle execution is claimed.
+
+The old flow budget omitted startup:941's896 selects issue at19..915 with
+only one hole, so their conditional finish floor is915, NOT896. New flow
+is864 at19..902,20 holes, conditional finish883. Eleven exchange groups
+leave894 flow, too many for900 at the same startup; this motivated14–16
+groups rather than blindly minimizing load count.
+
+There are512 record vloads +1,152 scalar gathers =1,664 body lookup loads,
+first/last53/917, conditional finish885, drain10. More exchange groups keep
+compute constant but consume load headroom:18 groups already use1,799
+total loads. The full workspace holds256 encoded fields /248 unique nodes;
+header, forest and all other memory outside output/workspace remain intact.
+Offloaded343 vector ops, fragmented230, max fragment span39. Five dead
+constant loads are pruned. All counts include runtime preprocessing.
+
+The local verifier additionally exhausts all eight depth3 path-bit patterns
+and both next-child choices against the declared workspace layout. Analyzer
+output now includes first/last issue and conditional bounds for each engine,
+weighted compute, distinct encoded-node count, and true semantic round for
+the priority-delayed selects. Disabling exchange/shallow landing and setting
+setup cap4 exactly restores941/1480; that control also passes official9/9.
+
+Next focus on startup/tail gaps and further real work removal. Aggregate900
+is now barely feasible, not comfortably feasible. Another scheduling sweep
+alone is not evidence it will reach900; specifically inspect the20 flow
+holes, load readiness and ten-cycle tail on the cheaper graph.
+
+Reproduction: see `experiments/README.md` iteration38. Every probe pins941;
+production imports none of them. No leaderboard lookup or external
+submission occurred, so928 is our local best, not a claimed global record.
