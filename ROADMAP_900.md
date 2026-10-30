@@ -1,6 +1,43 @@
 # Roadmap toward 900 cycles: measure, rebalance, remove gathers
 
-Latest accepted implementation, iteration41 (2026-09-19): **923 cycles**,
+Latest accepted implementation, iteration42 (2026-10-30): **921 cycles**,
+scratch **1,400/1,536**. Parent is the pushed923 checkpoint
+`d014c591f63298a9b00971decebd6cc004d1ce29`. This checkpoint contains the
+verified18-group exchange and bounded research records. Official9/9,
+built-in3/3,32 frozen seeds,eight full-word fixtures, emission/provenance,
+workspace/allocator checks and all extra shapes/path depths pass.
+
+Use depth3 gathers for18 rather than16 groups in the first traversal.
+Each extra group replaces seven selects with eight loads and one bias
+select: net+16 loads/−12 flow, unchanged arithmetic6742.625. Final slots
+are load1791, VALU5415, ALU10621, flow884, store64. The final lookup advances
+912→910 and the ten-cycle drain remains. The production change is one
+constant; the accepted scheduling policy, hash and record layout are retained.
+
+`--compact-depth3-gather-chunks 16 17 18` gives923/922/921 with all236
+policies. Short input-address pairs reach922 independently but do not add
+to the exchange improvement. Vector address blocks take924 on the old graph.
+A new six-select/one-MAC cached lookup saves flow but takes923–930 because
+its extra arithmetic and setup still need to execute. See iteration42 results.
+
+The fixed921 graph now has load+tail bound906 and flow+tail bound898.
+This removes the old910 obstruction but still rules out900 by priority
+tuning alone. If the11-operation minimum load tail stays, load count must
+fall from1791 to at most1780: at least11 loads must go. Alternatively the
+17-group graph needs at least three fewer loads and four fewer flow slots
+to remove its902/904 bounds. Any replacement must also fit compute/startup.
+
+Next evaluate a structural candidate against that joint budget before
+scheduling it. Increasing exchange further takes925/929/933 for19/20/21
+groups in measured screens;22+ already has a load bound>=922 and cannot
+beat921 on this family. The17-group graph's smaller bound still gives a
+slower actual schedule, so passing a bound is only a necessary condition.
+There are21 elapsed cycles to900. No900 schedule or global record is claimed.
+
+The following iteration41 status and budget are historical. Its controls
+assume `--compact-depth3-gather-chunks 16`; the default is now18.
+
+Accepted implementation, iteration41 (2026-09-19): **923 cycles**,
 scratch **1,416/1,536**. First committed and pushed the verified924 baseline
 as `109610180033baa744a0fe80a2501e1ba2f73b00` to the user's fork, branch
 `optimize/kernel-v2`. This checkpoint bundles the verified923 implementation

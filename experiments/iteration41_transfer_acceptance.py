@@ -58,6 +58,9 @@ def build(module):
 
 
 def run():
+    # Compare this historical address change on its original16-group graph.
+    original_gather_chunks = production.COMPACT_DEPTH3_GATHER_CHUNKS
+    production.COMPACT_DEPTH3_GATHER_CHUNKS = 16
     check_add_imm_provenance()
     results = []
     for enabled in (True, False):
@@ -86,6 +89,7 @@ def run():
                             weighted=slots['valu']+slots['alu']/8,
                             flow_first_last=[min(flow),max(flow)], lookup_first_last=[min(lookup),max(lookup)]))
     production.COMPACT_INPUT_IMMEDIATE = True
+    production.COMPACT_DEPTH3_GATHER_CHUNKS = original_gather_chunks
     print(json.dumps(dict(source_ref=SOURCE_REF, add_imm_provenance_selftest='pass', results=results), indent=2))
 
 

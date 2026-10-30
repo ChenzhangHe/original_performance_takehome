@@ -3191,3 +3191,85 @@ computation structure to remove the910 obstruction before further priority
 sweeps. Preserve pinned924 as a useful lower-flow alternative. Recompute
 resource-plus-tail bounds on proposed graphs; do not assume independent
 local gains, shorter path-bit latency, or smaller work totals compose.
+
+## Iteration42 — rebalance flow/load, reach921 (2026-10-30)
+
+Resume from clean `optimize/kernel-v2` at
+`d014c591f63298a9b00971decebd6cc004d1ce29`, the pushed923 checkpoint.
+Fresh official9/9 confirms923. All new transforms pin that source.
+The default shell now selects Python3.9, which fails to parse the original
+match statements; use installed `/opt/homebrew/bin/python3.13` (3.13.11).
+No test/simulator edits or dependency installation were needed.
+
+Accepted: **921 cycles / scratch1400**, down from923/1416. Change only
+`COMPACT_DEPTH3_GATHER_CHUNKS=18` in production. Two more first-traversal
+groups exchange cached depth3 selects for gathers. Each adds eight loads,
+removes six flow instructions, and preserves work. Net+16loads/−12flow.
+All236 original policy candidates are retained; the winner remains
+`fragment_adaptive_tail_hetero_360_240_240_220_900`.
+
+| Metric | Parent923 | Accepted921 |
+| --- | ---: | ---: |
+| Scratch | 1416 | 1400 |
+| Load / flow slots | 1775 / 896 | 1791 / 884 |
+| Physical VALU / ALU | 5414 / 10629 | 5415 / 10621 |
+| Weighted work | 6742.625 | 6742.625 |
+| Body lookup loads | 1664 | 1680 |
+| First / last body lookup | 51 / 912 | 51 / 910 |
+| First / last flow | 0 / 896 | 0 / 894 |
+| Holes within flow span | 1 | 11 |
+| Gather-to-store drain | 10 | 10 |
+| Load+tail / flow+tail bounds | 898 / 910 | 906 / 898 |
+
+Logical VALU5775/ALU7741, stores64,256 workspace fields/248 distinct encoded
+nodes and five pruned loads stay unchanged. There are360 offloaded vectors,
+260 fragmented, maximum inclusive span43. First VALU/ALU remains1/2;
+the aggregate compute floor900 and startup-conditioned901 remain optimistic
+necessary counts, not executed schedules.
+
+Fresh production passes official9/9, built-in3/3,32 frozen seeds,eight full
+32-bit fixtures, exact emission, scratch provenance, workspace/setup and
+allocator checks. Six generic shapes retain72/150/350/751/590/1614 cycles;
+path depths0/2/3 retain1013/1003/994. Production16/18 exactly matches pinned
+prototypes in emitted instructions, logical slots/dependencies, first/final/
+lane issue times, scratch and all236 policy results. Historical acceptance
+scripts40/41 now explicitly retain16 groups for their old controls.
+
+The bounded exchange study uses resource tails to select its range:
+16/17/18 groups give923/922/921 with full policies.19/20/21 give925/929/933
+in three-policy screens.22 would need1823 loads; with an11-operation minimum
+output tail its bound isceil(1823/2)+10=922, so22+ cannot beat921 without
+another graph change. The17-group bound is lower than18's, but actual runtime
+is higher; a necessary budget is not a performance predictor.
+
+Alternate address graphs were costed and tested. Sixteen short scalar pairs
+tie923; pairs only in high24 groups give922 with full policies, but923 when
+combined with18 exchange groups. Eight independent anchors plus three vector
+subtracts generate the remaining24 input addresses, but require a stride
+constant/broadcast and joint readiness for each block; they take924 on the
+old graph,922 with18 groups. Their work and scratch exceed the simple winner.
+
+A new cached depth3 lookup computes runtime sibling differences, selects
+base and slope with six flow operations, then uses one MAC instead of the
+seventh select. Four temporary vectors stay in the existing node span.
+The all-cache variant adds46.5 compute equivalents and takes930; changing
+only eight final groups adds12.5 and takes923 with full policies. Sixteen
+final groups also takes923 in the screen. Flow falls, but the displaced
+arithmetic still needs issue capacity. The expressions work for arbitrary
+32-bit node values; all setup and stored-padding correctness are included.
+
+Direct root encoding removes one ALU but only ties921 on the new graph.
+Narrowing depth3's store readiness brings the first lookup51→44 yet takes923,
+alone or with the root cleanup. Neither is promoted. All valid candidates
+pass exact emission/dependency/capacity, scratch provenance, three frozen
+seeds, exhaustive addresses and a full-word memory fixture. Policy scope is
+explicit in `experiments/iteration42_results.md`; discarded schedules are
+not presented as independently allocated/validated candidates.
+
+The next structural budget is more specific: the fixed921 graph has load
+bound906, so900 still needs a graph/resource change. Keeping its11-operation
+minimum load tail requires at least11 fewer loads (1791→<=1780). The17-group
+alternative needs at least three fewer loads and four fewer flow operations.
+Extra arithmetic and startup must fit too. No complete900 route, leaderboard
+score, or global optimality claim is made. The checkpoint preserves the
+verified921 implementation, reproduction commands and negative results.

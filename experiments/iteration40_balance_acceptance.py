@@ -35,6 +35,8 @@ def run():
     # Keep this historical on/off comparison on the pre-iteration41 graph.
     original_input_immediate = production.COMPACT_INPUT_IMMEDIATE
     production.COMPACT_INPUT_IMMEDIATE = False
+    original_gather_chunks = production.COMPACT_DEPTH3_GATHER_CHUNKS
+    production.COMPACT_DEPTH3_GATHER_CHUNKS = 16
     results = []
     for enabled in (True, False):
         args = Namespace(full_policies=True, age=0, choose='priority', valu_fma=enabled,
@@ -70,6 +72,7 @@ def run():
                             partial_max=max(max(x)-min(x) for x in integrated.lane_issue_cycles.values())))
     production.COMPACT_FMA_PRIORITY = True
     production.COMPACT_INPUT_IMMEDIATE = original_input_immediate
+    production.COMPACT_DEPTH3_GATHER_CHUNKS = original_gather_chunks
     print(json.dumps(dict(source_ref=SOURCE_REF, results=results), indent=2))
 
 

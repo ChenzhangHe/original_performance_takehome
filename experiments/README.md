@@ -162,7 +162,7 @@ python3 experiments/iteration38_exchange_readiness.py --groups 16 17 18 19 20 21
 # Production controls and complete acceptance.
 python3 tune_kernel.py --compact-startup-groups 0 --compact-flow-exchange 0 --compact-shallow-landing 0 --compact-setup-deadline-cap 4 --seeds 123 456 789  # 941
 python3 tune_kernel.py --compact-startup-groups 0 --compact-flow-exchange 0 --seeds 123 456 789  # 940
-python3 tune_kernel.py --compact-input-immediate 0 --compact-fma-priority 0 --compact-startup-groups 0 --compact-deep-select-delay 0 1 --seeds 123 456 789  # 930/928
+python3 tune_kernel.py --compact-depth3-gather-chunks 16 --compact-input-immediate 0 --compact-fma-priority 0 --compact-startup-groups 0 --compact-deep-select-delay 0 1 --seeds 123 456 789  # 930/928
 python3 verify_kernel.py --extra-shapes
 ```
 
@@ -203,7 +203,7 @@ python3 experiments/iteration39_readiness.py --inspect
 # --compare-production was valid at the927 checkpoint; current default is924.
 python3 experiments/iteration39_readiness.py --bootstrap-dag 2 --bootstrap-critical --full-policies
 # Production baseline/winner and comprehensive regression.
-python3 tune_kernel.py --compact-input-immediate 0 --compact-fma-priority 0 --compact-startup-groups 0 2 --seeds 123 456 789  # 928/927
+python3 tune_kernel.py --compact-depth3-gather-chunks 16 --compact-input-immediate 0 --compact-fma-priority 0 --compact-startup-groups 0 2 --seeds 123 456 789  # 928/927
 python3 verify_kernel.py --extra-shapes
 ```
 
@@ -229,7 +229,7 @@ python3 -B experiments/iteration40_balance.py --full-policies
 python3 -B experiments/iteration40_balance.py --valu-fma --fma-mode only_fma --full-policies
 # Exact production/pinned comparison, flag both enabled and disabled.
 python3 -B experiments/iteration40_balance_acceptance.py
-python3 -B tune_kernel.py --compact-input-immediate 0 --compact-fma-priority 0 1 --seeds 123 456 789  # 927/924
+python3 -B tune_kernel.py --compact-depth3-gather-chunks 16 --compact-input-immediate 0 --compact-fma-priority 0 1 --seeds 123 456 789  # 927/924
 
 # Independent readiness win926, not an additive gain on top of924.
 python3 -B experiments/iteration40_prefetch.py --full-policies
@@ -279,7 +279,7 @@ acceptance give923/scratch1416. The hash and record layout are unchanged.
 # Accepted address transform and exact integrated on/off equivalence.
 python3 -B experiments/iteration41_transfer.py --inputs-immediate --full-policies
 python3 -B experiments/iteration41_transfer_acceptance.py
-python3 -B tune_kernel.py --compact-input-immediate 0 1 --seeds 123 456 789  # 924/923
+python3 -B tune_kernel.py --compact-depth3-gather-chunks 16 --compact-input-immediate 0 1 --seeds 123 456 789  # 924/923
 
 # Correct negative address controls:924,924 and927 screen respectively.
 python3 -B experiments/iteration41_transfer.py --root alias --full-policies
@@ -324,3 +324,44 @@ emission/dependencies/capacity, scratch provenance, three frozen seeds and
 full-word output/workspace; full means236 policies. Accepted production has
 the broader official9/9, built-in3/3,32-seed/eight-fixture and extra-shape
 coverage. No official tests or machine semantics changed.
+
+## Iteration42: rebalance the changed resource graph, 921 cycles
+
+All new probes pin `d014c591f63298a9b00971decebd6cc004d1ce29` (923).
+The accepted change exchanges18 rather than16 first-traversal depth3 groups:
+loads+16, flow−12, unchanged arithmetic. It reaches921/scratch1400 with all
+236 policies. See `iteration42_results.md` for all controls and budgets.
+Commands below assume Python>=3.10; this run used
+`/opt/homebrew/bin/python3.13` because the shell default was3.9.
+
+```sh
+python3 -B experiments/iteration42_addresses.py --exchange-groups 16 --full-policies  # 923
+python3 -B experiments/iteration42_addresses.py --exchange-groups 17 --full-policies  # 922
+python3 -B experiments/iteration42_addresses.py --exchange-groups 18 --full-policies  # 921
+python3 -B experiments/iteration42_addresses.py --exchange-groups 19  # 925 screen
+python3 -B experiments/iteration42_addresses.py --exchange-groups 20  # 929 screen
+python3 -B experiments/iteration42_addresses.py --exchange-groups 21  # 933 screen
+python3 -B experiments/iteration42_addresses.py --addresses high_pairs --full-policies  # 922, no additive gain
+python3 -B experiments/iteration42_addresses.py --addresses vector8  # 924
+
+# New lookup structure trades one select for a runtime affine MAC.
+python3 -B experiments/iteration42_coefficients.py --coefficients all  # 930 screen
+python3 -B experiments/iteration42_coefficients.py --coefficients final --final-groups 8 --full-policies  # 923
+
+# Production controls and comprehensive acceptance.
+python3 -B tune_kernel.py --compact-depth3-gather-chunks 16 17 18 --seeds 123 456 789
+python3 -B tests/submission_tests.py
+python3 -B perf_takehome.py
+python3 -B verify_kernel.py --extra-shapes
+# Historical controls retain their original16-group graph automatically.
+python3 -B experiments/iteration40_balance_acceptance.py
+python3 -B experiments/iteration41_transfer_acceptance.py
+```
+
+Every retained runtime probe checks emission/dependencies/capacity,
+scratch provenance, three frozen seeds, workspace addresses and a full-word
+memory fixture. The921 production has the broader official/full regression
+coverage. Its fixed-graph lower bound is906 from load capacity plus the
+remaining output path, so900 still requires a structural change. Twenty-two
+or more exchange groups already have a load bound>=922, pruning them from
+this family. Production imports none of the experiment scripts.
